@@ -197,6 +197,10 @@ class DAobjTwoStagePseudoLabGeneralizedRCNN(GeneralizedRCNN):
             """
             # roi_head lower branch (keep this for further production)
             # notice that we do not use any target in ROI head to do inference!
+            # print("Images: " + str(images))
+            # print("Features: " + str(features))
+            # print("given_proposals: " + str(given_proposals))
+        
             proposals_roih, ROI_predictions = self.roi_heads(
                 images,
                 features,

@@ -12,16 +12,19 @@ class ConsistencyLosses:
         for s_roi, t_roi in zip (student_roi, teacher_roi):
             class_scores_student.append(s_roi.full_scores) #[:,:-1])
             class_scores_teacher.append(t_roi.full_scores) #[:,:-1])
-        class_scores_student=torch.cat(class_scores_student,axis=0)
-        class_scores_teacher=torch.cat(class_scores_teacher,axis=0)
+        if class_scores_student and class_scores_teacher:
+            class_scores_student=torch.cat(class_scores_student,axis=0)
+            class_scores_teacher=torch.cat(class_scores_teacher,axis=0)
 
-        # Weighted KL Divergence
-        weights = class_scores_teacher.max(axis=1).values
-        kl_loss = self.kldivloss(torch.log(class_scores_student),class_scores_teacher)
-        kl_loss = kl_loss.mean(axis=1)*weights
-        kl_loss = torch.mean(kl_loss)
+            # Weighted KL Divergence
+            weights = class_scores_teacher.max(axis=1).values
+            kl_loss = self.kldivloss(torch.log(class_scores_student),class_scores_teacher)
+            kl_loss = kl_loss.mean(axis=1)*weights
+            kl_loss = torch.mean(kl_loss)
 
-        loss['loss_cls_pseudo'] = kl_loss
+            loss['loss_cls_pseudo'] = kl_loss
+            return loss
+        loss['loss_cls_pseudo'] = torch.zeros(1).data[0]
 
         return loss
     

@@ -2,7 +2,6 @@ import torch
 import torchvision.transforms as T
 import numpy as np
 from numpy import random as R
-import cv2
 
 class NightAug:
     def __init__(self):
@@ -71,7 +70,7 @@ class NightAug:
 
             #Noise
             if R.random()>0.5:
-                n = torch.clamp(torch.normal(0,R.randint(50),img.shape),min=0).cuda()
+                n = torch.clamp(torch.normal(0,R.randint(1,50),img.shape),min=0).cuda()
                 img = n + img
                 img = torch.clamp(img,max = 255).type(torch.uint8)
 

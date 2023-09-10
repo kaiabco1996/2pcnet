@@ -282,6 +282,14 @@ class TwoPCTrainer(DefaultTrainer):
             record_dict, _, _, _ = self.model(
                 label_data, branch="supervised")
             
+            record_dict_night, _, _, _ = self.model(
+                unlabel_data, branch="supervised")
+             
+            temp_dict = {}
+            for key in record_dict_night.keys():
+                 temp_dict[key+'_night'] = record_dict_night[key]
+            record_dict.update(temp_dict)
+            
             # weight losses
             loss_dict = {}
             for key in record_dict.keys():
@@ -417,6 +425,9 @@ class TwoPCTrainer(DefaultTrainer):
                     given_proposals=proposals_into_roih, 
                     proposal_index=pred_idx
                 )
+                
+            # print("roi stu: "+ str(roi_stu))
+            # print("roi teach: "+ str(roi_teach))
             
             # 10. Compute consistency loss
             cons_loss = self.consistency_losses.losses(roi_stu,roi_teach)

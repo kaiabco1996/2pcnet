@@ -134,7 +134,9 @@ def fast_rcnn_inference_single_image(
     filter_mask = scores > score_thresh  # R x K
     # R' x 2. First column contains indices of the R predictions;
     # Second column contains indices of classes.
+    #print("filter_mask: " + str(filter_mask))
     filter_inds = filter_mask.nonzero()
+    #print("filter_inds: " + str(filter_inds))
     if num_bbox_reg_classes == 1:
         boxes = boxes[filter_inds[:, 0], 0]
     else:
@@ -152,6 +154,8 @@ def fast_rcnn_inference_single_image(
 
    # index scores_all
     scores_all = scores_all[keep]
+    #print("filter_inds 2: " + str(filter_inds))
+    
 
     result = Instances(image_shape)
     result.pred_boxes = Boxes(boxes)
@@ -378,23 +382,35 @@ class FastRCNNOutputLayers(nn.Module):
             list[Instances]: same as `fast_rcnn_inference`.
             list[Tensor]: same as `fast_rcnn_inference`.
         """
+        # print(proposals)
+        # print(predictions)
         boxes = self.predict_boxes(predictions, proposals)
         scores = self.predict_probs(predictions, proposals)
         image_shapes = [x.image_size for x in proposals]
         if proposal_index:
             predictions = []
             for i in range(len(proposals)):
-                inst = Instances(image_shapes[0])
-                inst.full_scores = scores[i][proposal_index[i],:]
-                inst.pred_classes = torch.max(scores[i][proposal_index[i],:-1],axis=1).indices
+                if not proposal_index[i].numel() == 0:
+                    inst = Instances(image_shapes[0])
+                    inst.full_scores = scores[i][proposal_index[i],:]
+                    # print("scores: "+str(scores))
+                    # print("scores[i]: "+str(scores[i]))
+                    # print("i: " + str(i))
+                    # print("proposal i: "+str(proposal_index[i]))
+                    # print("proposal all: "+str(proposal_index))
+                    # print("full scores: "+str(scores[i][proposal_index[i],:]))
+                    # print("full scores 2: "+str(scores[i][proposal_index[i],:-1]))
+                    # print("full scores 3: "+str(torch.max(scores[i][proposal_index[i],:-1])))
+                    
+                    inst.pred_classes = torch.max(scores[i][proposal_index[i],:-1],axis=1).indices
 
-                num_bbox_reg_classes = boxes[i].shape[1] // 4
-                new_boxes= Boxes(boxes[i].reshape(-1, 4))
-                new_boxes.clip(image_shapes[i])
-                new_boxes = new_boxes.tensor.view(-1, num_bbox_reg_classes, 4) 
-                inst.pred_boxes = new_boxes[proposal_index[i],inst.pred_classes]
+                    num_bbox_reg_classes = boxes[i].shape[1] // 4
+                    new_boxes= Boxes(boxes[i].reshape(-1, 4))
+                    new_boxes.clip(image_shapes[i])
+                    new_boxes = new_boxes.tensor.view(-1, num_bbox_reg_classes, 4) 
+                    inst.pred_boxes = new_boxes[proposal_index[i],inst.pred_classes]
 
-                predictions.append(inst)
+                    predictions.append(inst)
             return predictions, []
         # ADD filtering for teacher here if needed
 
