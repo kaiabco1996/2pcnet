@@ -3,11 +3,15 @@ import time
 import logging
 import json
 import torch
+import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 from fvcore.nn.precise_bn import get_bn_modules
 import numpy as np
 from collections import OrderedDict
 import torchvision.transforms as T
+from torch.nn import functional as F
+from FDA.utils import FDA_source_to_target_unet
+import torchvision.transforms as transforms
 
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
@@ -23,6 +27,11 @@ from detectron2.structures.boxes import Boxes
 from detectron2.structures.instances import Instances
 from detectron2.utils.env import TORCH_VERSION
 from detectron2.data import MetadataCatalog
+import segmentation_models_pytorch as smp
+from twophase.modeling.meta_arch.rcnn import FCDiscriminator_img
+from twophase.modeling.meta_arch.rcnn import Discriminator
+
+
 
 from twophase.data.build import (
     build_detection_semisup_train_loader,
@@ -37,7 +46,18 @@ from twophase.solver.build import build_lr_scheduler
 from twophase.evaluation import PascalVOCDetectionEvaluator, COCOEvaluator
 from twophase.modeling.custom_losses import ConsistencyLosses
 from twophase.data.transforms.night_aug import NightAug
+from torchvision.utils import save_image
 import copy
+
+def weights_init_normal(m):
+        classname = m.__class__.__name__
+        if classname.find('Conv') != -1:
+            torch.nn.init.normal_(m.weight.data, 0.0, 0.02) # reset Conv2d's weight(tensor) with Gaussian Distribution
+            if hasattr(m, 'bias') and m.bias is not None:
+                torch.nn.init.constant_(m.bias.data, 0.0) # reset Conv2d's bias(tensor) with Constant(0)
+            elif classname.find('BatchNorm2d') != -1:
+                torch.nn.init.normal_(m.weight.data, 1.0, 0.02) # reset BatchNorm2d's weight(tensor) with Gaussian Distribution
+                torch.nn.init.constant_(m.bias.data, 0.0) # reset BatchNorm2d's bias(tensor) with Constant(0)
 
 # Adaptive Teacher Trainer
 class TwoPCTrainer(DefaultTrainer):
@@ -58,6 +78,19 @@ class TwoPCTrainer(DefaultTrainer):
         # create an teacher model
         model_teacher = self.build_model(cfg)
         self.model_teacher = model_teacher
+        
+        self.unet_model = smp.Unet('mobilenet_v2', encoder_weights='imagenet', classes=3, activation=None, encoder_depth=5, decoder_channels=[256, 128, 64, 32, 16]).cuda()
+        input_shape = (3, 600, 1067)
+        self.discriminator = Discriminator(input_shape).cuda()#FCDiscriminator_img(num_classes=1067*600).cuda()
+        self.discriminator.apply(weights_init_normal)
+        b1 = 0.5 # adam : decay of first order momentum of gradient
+        b2 = 0.999
+        self.optimizer_D_A = torch.optim.Adam(
+        self.discriminator.parameters(), lr=0.0002, betas=(b1,b2))
+        max_lr = 1e-3
+        epoch = 15
+        weight_decay = 1e-4
+        self.optimizer_unet = torch.optim.AdamW(self.unet_model.parameters(), lr=max_lr, weight_decay=weight_decay)
 
         # For training, wrap with DDP. But don't need this for inference.
         if comm.get_world_size() > 1:
@@ -262,6 +295,7 @@ class TwoPCTrainer(DefaultTrainer):
 
     def run_step_full_semisup(self):
         self._trainer.iter = self.iter
+        start_iter = self.iter
         assert self.model.training, "[UBTeacherTrainer] model was changed to eval mode!"
         start = time.perf_counter()
         data = next(self._trainer._data_loader_iter)
@@ -269,184 +303,236 @@ class TwoPCTrainer(DefaultTrainer):
         # label_strong, label_weak, unlabed_strong, unlabled_weak
         label_data, unlabel_data = data
         data_time = time.perf_counter() - start
+        
+        criterion_GAN = torch.nn.MSELoss()
+        criterion_cycle = torch.nn.L1Loss()
+        criterion_identity = torch.nn.L1Loss()
+        source_label = 0
+        target_label = 1
+        
+        
+        record_dict = {}
+        src_in_trg = [FDA_source_to_target_unet(x["image"], y["image"], self.unet_model) for x, y in zip(label_data, unlabel_data)]
+        
+        if start_iter%500 == 0:
+            save_image([label["image"].type(torch.float32)/255 for label in label_data],'./demo_images/'+"src_"+str(start_iter)+'.png')
+            save_image([label["image"].type(torch.float32)/255 for label in src_in_trg],'./demo_images/'+"src_to_target_"+str(start_iter)+'.png')
+        self.optimizer_unet.zero_grad()
+        #Consistency Loss
+        loss_consistency_fda = torch.sum(torch.tensor([criterion_cycle(x["image"], y["image"]) for x, y in zip(src_in_trg, label_data)], requires_grad=True))
+        loss_consistency_fda_amp = torch.sum(torch.tensor([criterion_cycle(x["src_amp"], x["fake_amp"]) for x in src_in_trg], requires_grad=True))
+        discriminator_img_out_t_faked = [self.discriminator(torch.unsqueeze(x["image"], 0).cuda()) for x in src_in_trg]#[self.discriminator(x) for x in src_in_trg]
+        loss_discriminator_t_faked = torch.sum(torch.tensor([F.binary_cross_entropy_with_logits(z, torch.FloatTensor(z.data.size()).fill_(target_label).cuda()) for z in discriminator_img_out_t_faked], requires_grad=True))
+        
+        loss_consistency_fda.backward()
+        loss_consistency_fda_amp.backward()
+        loss_discriminator_t_faked.backward()
+        self.optimizer_unet.step()
+        
+        self.optimizer_D_A.zero_grad()
+        #Discriminator Loss
+        discriminator_img_out_t = [self.discriminator(torch.unsqueeze(x["image"], 0).cuda()) for x in src_in_trg]#[self.discriminator(x) for x in src_in_trg]
+        discriminator_img_out_s = [self.discriminator(torch.unsqueeze(x["image"].float(), 0).cuda()) for x in label_data]#[self.discriminator(x) for x in src_in_trg]
+        discriminator_img_out_real_t = [self.discriminator(torch.unsqueeze(x["image"].float(), 0).cuda()) for x in unlabel_data]#[self.discriminator(x) for x in src_in_trg]
+        
+        
+        loss_discriminator_t = torch.sum(torch.tensor([F.binary_cross_entropy_with_logits(z, torch.FloatTensor(z.data.size()).fill_(source_label).cuda()) for z in discriminator_img_out_t], requires_grad=True))
+        loss_discriminator_s = torch.sum(torch.tensor([F.binary_cross_entropy_with_logits(z, torch.FloatTensor(z.data.size()).fill_(source_label).cuda()) for z in discriminator_img_out_s], requires_grad=True))
+        loss_discriminator_real_t = torch.sum(torch.tensor([F.binary_cross_entropy_with_logits(z, torch.FloatTensor(z.data.size()).fill_(target_label).cuda()) for z in discriminator_img_out_real_t], requires_grad=True))
+        
+        loss_discriminator_t.backward()
+        loss_discriminator_s.backward()
+        loss_discriminator_real_t.backward()
+        
+        self.optimizer_D_A.step()
+        
+        temp_dict = {
+                'loss_consistency_fda': loss_consistency_fda,
+                'loss_consistency_fda_amp': loss_consistency_fda_amp,
+                'loss_discriminator_t_faked': loss_discriminator_t_faked,
+                'loss_discriminator_t': loss_discriminator_t,
+                'loss_discriminator_s': loss_discriminator_s,
+                'loss_discriminator_real_t': loss_discriminator_real_t,
+            }
+        record_dict.update(temp_dict)
 
-        # Add NightAug images into supervised batch
-        if self.cfg.NIGHTAUG:
-            label_data_aug = self.night_aug.aug([x.copy() for x in label_data])
-            label_data.extend(label_data_aug)
+        # # Add NightAug images into supervised batch
+        # if self.cfg.NIGHTAUG:
+        #     label_data_aug = self.night_aug.aug([x.copy() for x in label_data])
+        #     label_data.extend(label_data_aug)
             
 
-        # burn-in stage (supervised training with labeled data)
-        if self.iter < self.cfg.SEMISUPNET.BURN_UP_STEP:
+        # # burn-in stage (supervised training with labeled data)
+        # if self.iter < self.cfg.SEMISUPNET.BURN_UP_STEP:
 
-            record_dict, _, _, _ = self.model(
-                label_data, branch="supervised")
+        #     record_dict, _, _, _ = self.model(
+        #         label_data, branch="supervised")
             
-            record_dict_night, _, _, _ = self.model(
-                unlabel_data, branch="supervised")
+        #     record_dict_night, _, _, _ = self.model(
+        #         unlabel_data, branch="supervised")
              
-            temp_dict = {}
-            for key in record_dict_night.keys():
-                 temp_dict[key+'_night'] = record_dict_night[key]
-            record_dict.update(temp_dict)
+        #     temp_dict = {}
+        #     for key in record_dict_night.keys():
+        #          temp_dict[key+'_night'] = record_dict_night[key]
+        #     record_dict.update(temp_dict)
             
-            # weight losses
-            loss_dict = {}
-            for key in record_dict.keys():
-                if key[:4] == "loss":
+        #     # weight losses
+        #     loss_dict = {}
+        #     for key in record_dict.keys():
+        #         if key[:4] == "loss":
+        #             loss_dict[key] = record_dict[key] * 1
+        #     losses = sum(loss_dict.values())
+
+        # # Student-teacher stage
+        # else:
+        #     if self.iter == self.cfg.SEMISUPNET.BURN_UP_STEP:
+        #         # update copy the the whole model
+        #         self._update_teacher_model(keep_rate=0.00)
+
+        #     elif (
+        #         self.iter - self.cfg.SEMISUPNET.BURN_UP_STEP
+        #     ) % self.cfg.SEMISUPNET.TEACHER_UPDATE_ITER == 0:
+        #         self._update_teacher_model(
+        #             keep_rate=self.cfg.SEMISUPNET.EMA_KEEP_RATE)
+
+        #     record_dict = {}
+
+        #     # 1. Input labeled data into student model
+        #     record_all_label_data, _, _, _ = self.model(
+        #         label_data, branch="supervised"
+        #     )
+        #     record_dict.update(record_all_label_data)
+
+        #     #  2. Remove unlabeled data labels
+        #     gt_unlabel = self.get_label(unlabel_data)
+        #     unlabel_data = self.remove_label(unlabel_data)
+
+        #     #  3. Generate the easy pseudo-label using teacher model (Phase-1)
+        #     with torch.no_grad():
+        #         (
+        #             _,
+        #             proposals_rpn_unsup,
+        #             proposals_roih_unsup,
+        #             _,
+        #         ) = self.model_teacher(unlabel_data, branch="unsup_data_weak")
+
+        #     #  4. Pseudo-labeling
+        #     cur_threshold = self.cfg.SEMISUPNET.BBOX_THRESHOLD
+
+        #     joint_proposal_dict = {}
+        #     joint_proposal_dict["proposals_rpn"] = proposals_rpn_unsup
+        #     #Process pseudo labels and thresholding
+        #     (
+        #         pesudo_proposals_rpn_unsup,
+        #         nun_pseudo_bbox_rpn,
+        #     ) = self.process_pseudo_label(
+        #         proposals_rpn_unsup, cur_threshold, "rpn", "thresholding"
+        #     )
+        #     joint_proposal_dict["proposals_pseudo_rpn"] = pesudo_proposals_rpn_unsup
+        #     # Pseudo_labeling for ROI head (bbox location/objectness)
+        #     pesudo_proposals_roih_unsup, _ = self.process_pseudo_label(
+        #         proposals_roih_unsup, cur_threshold, "roih", "thresholding"
+        #     )
+        #     joint_proposal_dict["proposals_pseudo_roih"] = pesudo_proposals_roih_unsup
+
+        #     # 5. Add pseudo-label to unlabeled data
+        #     unlabel_data = self.add_label(
+        #         unlabel_data, joint_proposal_dict["proposals_pseudo_roih"]
+        #     )
+
+        #     #6. Scale student inputs (pseudo-labels and image)
+        #     if self.cfg.STUDENT_SCALE:
+        #         scale_mask=np.where(self.iter<self.scale_checkpoints)[0]
+        #         if len(scale_mask)>0:
+        #             nstu_scale = self.scale_list[scale_mask[0]]
+        #         else:
+        #             nstu_scale = 1.0
+        #         self.stu_scale = np.random.normal(nstu_scale,0.15)
+        #         if self.stu_scale < 0.4:
+        #             self.stu_scale = 0.4
+        #         elif self.stu_scale > 1.0:
+        #             self.stu_scale = 1.0
+        #         scaled_unlabel_data = [x.copy() for x in unlabel_data]
+        #         img_s = scaled_unlabel_data[0]['image'].shape[1:]
+        #         self.scale_t = T.Resize((int(img_s[0]*self.stu_scale), int(img_s[1]*self.stu_scale)))
+        #         for item in scaled_unlabel_data:
+        #             item['image'] = item['image'].cuda()
+        #             item['image']=self.scale_t(item['image'])
+        #             item['instances'].gt_boxes.scale(self.stu_scale,self.stu_scale)
+        #             if nstu_scale < 1.0:
+        #                 gt_mask = item['instances'].gt_boxes.area()>16 #16*16
+        #             else:
+        #                 gt_mask = item['instances'].gt_boxes.area()>16 #8*8
+        #             gt_boxes = item['instances'].gt_boxes[gt_mask]
+        #             gt_classes = item['instances'].gt_classes[gt_mask]
+        #             scores = item['instances'].scores[gt_mask]
+        #             item['instances'] = Instances(item['image'].shape[1:],gt_boxes=gt_boxes, gt_classes = gt_classes, scores=scores)
+                
+        #     else:
+        #         # if student scaling is not used
+        #         scaled_unlabel_data = [x.copy() for x in unlabel_data] 
+
+        #     #7. Input scaled inputs into student
+        #     (pseudo_losses, 
+        #     proposals_into_roih, 
+        #     rpn_stu,
+        #     roi_stu,
+        #     pred_idx)= self.model(
+        #         scaled_unlabel_data, branch="consistency_target"
+        #     )
+        #     new_pseudo_losses = {}
+        #     for key in pseudo_losses.keys():
+        #         new_pseudo_losses[key + "_pseudo"] = pseudo_losses[
+        #             key
+        #         ]
+        #     record_dict.update(new_pseudo_losses)
+
+        #     #8. Upscale student RPN proposals for teacher
+        #     if self.cfg.STUDENT_SCALE:
+        #             stu_resized_proposals = []
+        #             for k,proposals in enumerate(proposals_into_roih):
+        #                 stu_resized_proposals.append(Instances(scaled_unlabel_data[0]['image'].shape[1:],
+        #                                         proposal_boxes = proposals.proposal_boxes.clone(),
+        #                                         objectness_logits = proposals.objectness_logits,
+        #                                         gt_classes = proposals.gt_classes,
+        #                                         gt_boxes = proposals.gt_boxes))
+        #                 stu_resized_proposals[k].proposal_boxes.scale(1/self.stu_scale,1/self.stu_scale)
+        #             proposals_into_roih=stu_resized_proposals
+            
+        #     #9. Generate matched pseudo-labels from teacher (Phase-2)
+        #     with torch.no_grad():
+        #         (_,
+        #         _,
+        #         roi_teach,
+        #         _
+        #         )= self.model_teacher(
+        #             unlabel_data, 
+        #             branch="unsup_data_consistency", 
+        #             given_proposals=proposals_into_roih, 
+        #             proposal_index=pred_idx
+        #         )
+                
+        #     # print("roi stu: "+ str(roi_stu))
+        #     # print("roi teach: "+ str(roi_teach))
+            
+        #     # 10. Compute consistency loss
+        #     cons_loss = self.consistency_losses.losses(roi_stu,roi_teach)
+        #     record_dict.update(cons_loss)
+
+        # weight losses
+        loss_dict = {}
+        for key in record_dict.keys():
+            if key.startswith("loss"):
+                if key == "loss_rpn_loc_pseudo": 
+                    loss_dict[key] = record_dict[key] * 0
+                elif key.endswith('loss_cls_pseudo'):
+                    loss_dict[key] = record_dict[key] * self.cfg.SEMISUPNET.UNSUP_LOSS_WEIGHT
+                elif key.endswith('loss_rpn_cls_pseudo'):
+                    loss_dict[key] = record_dict[key] 
+                else: 
                     loss_dict[key] = record_dict[key] * 1
-            losses = sum(loss_dict.values())
 
-        # Student-teacher stage
-        else:
-            if self.iter == self.cfg.SEMISUPNET.BURN_UP_STEP:
-                # update copy the the whole model
-                self._update_teacher_model(keep_rate=0.00)
-
-            elif (
-                self.iter - self.cfg.SEMISUPNET.BURN_UP_STEP
-            ) % self.cfg.SEMISUPNET.TEACHER_UPDATE_ITER == 0:
-                self._update_teacher_model(
-                    keep_rate=self.cfg.SEMISUPNET.EMA_KEEP_RATE)
-
-            record_dict = {}
-
-            # 1. Input labeled data into student model
-            record_all_label_data, _, _, _ = self.model(
-                label_data, branch="supervised"
-            )
-            record_dict.update(record_all_label_data)
-
-            #  2. Remove unlabeled data labels
-            gt_unlabel = self.get_label(unlabel_data)
-            unlabel_data = self.remove_label(unlabel_data)
-
-            #  3. Generate the easy pseudo-label using teacher model (Phase-1)
-            with torch.no_grad():
-                (
-                    _,
-                    proposals_rpn_unsup,
-                    proposals_roih_unsup,
-                    _,
-                ) = self.model_teacher(unlabel_data, branch="unsup_data_weak")
-
-            #  4. Pseudo-labeling
-            cur_threshold = self.cfg.SEMISUPNET.BBOX_THRESHOLD
-
-            joint_proposal_dict = {}
-            joint_proposal_dict["proposals_rpn"] = proposals_rpn_unsup
-            #Process pseudo labels and thresholding
-            (
-                pesudo_proposals_rpn_unsup,
-                nun_pseudo_bbox_rpn,
-            ) = self.process_pseudo_label(
-                proposals_rpn_unsup, cur_threshold, "rpn", "thresholding"
-            )
-            joint_proposal_dict["proposals_pseudo_rpn"] = pesudo_proposals_rpn_unsup
-            # Pseudo_labeling for ROI head (bbox location/objectness)
-            pesudo_proposals_roih_unsup, _ = self.process_pseudo_label(
-                proposals_roih_unsup, cur_threshold, "roih", "thresholding"
-            )
-            joint_proposal_dict["proposals_pseudo_roih"] = pesudo_proposals_roih_unsup
-
-            # 5. Add pseudo-label to unlabeled data
-            unlabel_data = self.add_label(
-                unlabel_data, joint_proposal_dict["proposals_pseudo_roih"]
-            )
-
-            #6. Scale student inputs (pseudo-labels and image)
-            if self.cfg.STUDENT_SCALE:
-                scale_mask=np.where(self.iter<self.scale_checkpoints)[0]
-                if len(scale_mask)>0:
-                    nstu_scale = self.scale_list[scale_mask[0]]
-                else:
-                    nstu_scale = 1.0
-                self.stu_scale = np.random.normal(nstu_scale,0.15)
-                if self.stu_scale < 0.4:
-                    self.stu_scale = 0.4
-                elif self.stu_scale > 1.0:
-                    self.stu_scale = 1.0
-                scaled_unlabel_data = [x.copy() for x in unlabel_data]
-                img_s = scaled_unlabel_data[0]['image'].shape[1:]
-                self.scale_t = T.Resize((int(img_s[0]*self.stu_scale), int(img_s[1]*self.stu_scale)))
-                for item in scaled_unlabel_data:
-                    item['image'] = item['image'].cuda()
-                    item['image']=self.scale_t(item['image'])
-                    item['instances'].gt_boxes.scale(self.stu_scale,self.stu_scale)
-                    if nstu_scale < 1.0:
-                        gt_mask = item['instances'].gt_boxes.area()>16 #16*16
-                    else:
-                        gt_mask = item['instances'].gt_boxes.area()>16 #8*8
-                    gt_boxes = item['instances'].gt_boxes[gt_mask]
-                    gt_classes = item['instances'].gt_classes[gt_mask]
-                    scores = item['instances'].scores[gt_mask]
-                    item['instances'] = Instances(item['image'].shape[1:],gt_boxes=gt_boxes, gt_classes = gt_classes, scores=scores)
-                
-            else:
-                # if student scaling is not used
-                scaled_unlabel_data = [x.copy() for x in unlabel_data] 
-
-            #7. Input scaled inputs into student
-            (pseudo_losses, 
-            proposals_into_roih, 
-            rpn_stu,
-            roi_stu,
-            pred_idx)= self.model(
-                scaled_unlabel_data, branch="consistency_target"
-            )
-            new_pseudo_losses = {}
-            for key in pseudo_losses.keys():
-                new_pseudo_losses[key + "_pseudo"] = pseudo_losses[
-                    key
-                ]
-            record_dict.update(new_pseudo_losses)
-
-            #8. Upscale student RPN proposals for teacher
-            if self.cfg.STUDENT_SCALE:
-                    stu_resized_proposals = []
-                    for k,proposals in enumerate(proposals_into_roih):
-                        stu_resized_proposals.append(Instances(scaled_unlabel_data[0]['image'].shape[1:],
-                                                proposal_boxes = proposals.proposal_boxes.clone(),
-                                                objectness_logits = proposals.objectness_logits,
-                                                gt_classes = proposals.gt_classes,
-                                                gt_boxes = proposals.gt_boxes))
-                        stu_resized_proposals[k].proposal_boxes.scale(1/self.stu_scale,1/self.stu_scale)
-                    proposals_into_roih=stu_resized_proposals
-            
-            #9. Generate matched pseudo-labels from teacher (Phase-2)
-            with torch.no_grad():
-                (_,
-                _,
-                roi_teach,
-                _
-                )= self.model_teacher(
-                    unlabel_data, 
-                    branch="unsup_data_consistency", 
-                    given_proposals=proposals_into_roih, 
-                    proposal_index=pred_idx
-                )
-                
-            # print("roi stu: "+ str(roi_stu))
-            # print("roi teach: "+ str(roi_teach))
-            
-            # 10. Compute consistency loss
-            cons_loss = self.consistency_losses.losses(roi_stu,roi_teach)
-            record_dict.update(cons_loss)
-
-            # weight losses
-            loss_dict = {}
-            for key in record_dict.keys():
-                if key.startswith("loss"):
-                    if key == "loss_rpn_loc_pseudo": 
-                        loss_dict[key] = record_dict[key] * 0
-                    elif key.endswith('loss_cls_pseudo'):
-                        loss_dict[key] = record_dict[key] * self.cfg.SEMISUPNET.UNSUP_LOSS_WEIGHT
-                    elif key.endswith('loss_rpn_cls_pseudo'):
-                        loss_dict[key] = record_dict[key] 
-                    else: 
-                        loss_dict[key] = record_dict[key] * 1
-
-            losses = sum(loss_dict.values())
+        losses = sum(loss_dict.values())
 
         metrics_dict = record_dict
         metrics_dict["data_time"] = data_time

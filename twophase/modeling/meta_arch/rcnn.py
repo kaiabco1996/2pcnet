@@ -16,6 +16,55 @@ from detectron2.utils.events import get_event_storage
 from detectron2.structures import ImageList
 
 #######################
+class Discriminator(nn.Module):
+    def __init__(self, input_shape):
+        super(Discriminator, self).__init__()
+        
+        channels, height, width = input_shape
+        
+        # Calculate output shape of image discriminator (PatchGAN)
+        self.output_shape = (1, height//2**4, width//2**4)
+        
+        def discriminator_block(in_filters, out_filters, normalize=True):
+            """Returns downsampling layers of each discriminator block"""
+            layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
+            if normalize:
+                layers.append(nn.InstanceNorm2d(out_filters))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+        
+        self.model = nn.Sequential(
+            *discriminator_block(channels, 64, normalize=False),
+            *discriminator_block(64, 128),
+            *discriminator_block(128,256),
+            *discriminator_block(256,512),
+            nn.ZeroPad2d((1,0,1,0)),
+            nn.Conv2d(512, 1, 4, padding=1)
+        )
+        
+    def forward(self, img):
+        return self.model(img)
+############### Image discriminator ##############
+class FCDiscriminator_img(nn.Module):
+    def __init__(self, num_classes, ndf1=256, ndf2=128):
+        super(FCDiscriminator_img, self).__init__()
+
+        self.conv1 = nn.Conv2d(num_classes, ndf1, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(ndf1, ndf2, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(ndf2, ndf2, kernel_size=3, padding=1)
+        self.classifier = nn.Conv2d(ndf2, 1, kernel_size=3, padding=1)
+
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.leaky_relu(x)
+        x = self.conv2(x)
+        x = self.leaky_relu(x)
+        x = self.conv3(x)
+        x = self.leaky_relu(x)
+        x = self.classifier(x)
+        return x
 
 @META_ARCH_REGISTRY.register()
 class DAobjTwoStagePseudoLabGeneralizedRCNN(GeneralizedRCNN):
