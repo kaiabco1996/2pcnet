@@ -86,10 +86,10 @@ class TwoPCTrainer(DefaultTrainer):
         b1 = 0.5 # adam : decay of first order momentum of gradient
         b2 = 0.999
         self.optimizer_D_A = torch.optim.Adam(
-        self.discriminator.parameters(), lr=0.0002, betas=(b1,b2))
-        max_lr = 1e-3
+        self.discriminator.parameters(), lr=0.2, betas=(b1,b2))#0.0002
+        max_lr = 0.5#1e-3
         epoch = 15
-        weight_decay = 1e-4
+        weight_decay = 1e-3#1e-4
         self.optimizer_unet = torch.optim.AdamW(self.unet_model.parameters(), lr=max_lr, weight_decay=weight_decay)
 
         # For training, wrap with DDP. But don't need this for inference.
@@ -188,9 +188,9 @@ class TwoPCTrainer(DefaultTrainer):
 
     def train(self):
         self.train_loop(self.start_iter, self.max_iter)
-        if hasattr(self, "_last_eval_results") and comm.is_main_process():
-            verify_results(self.cfg, self._last_eval_results)
-            return self._last_eval_results
+        # if hasattr(self, "_last_eval_results") and comm.is_main_process():
+        #     verify_results(self.cfg, self._last_eval_results)
+        #     return self._last_eval_results
 
     def train_loop(self, start_iter: int, max_iter: int):
         logger = logging.getLogger(__name__)
@@ -312,21 +312,29 @@ class TwoPCTrainer(DefaultTrainer):
         
         
         record_dict = {}
-        src_in_trg = [FDA_source_to_target_unet(x["image"], y["image"], self.unet_model) for x, y in zip(label_data, unlabel_data)]
+        src_in_trg = [FDA_source_to_target_unet(x["image"], y["image"], self.unet_model, start_iter) for x, y in zip(label_data, unlabel_data)]
+        #print(str(start_iter)+" transformation: " + str(src_in_trg))
+        image_consistency_lambda = 3
+        image_darkness_lambda = 2
         
         if start_iter%500 == 0:
-            save_image([label["image"].type(torch.float32)/255 for label in label_data],'./demo_images/'+"src_"+str(start_iter)+'.png')
-            save_image([label["image"].type(torch.float32)/255 for label in src_in_trg],'./demo_images/'+"src_to_target_"+str(start_iter)+'.png')
+            for x, y in zip(label_data, src_in_trg):
+                save_image([(x["image"]/255).type(torch.float32).cuda(),y["image"].type(torch.float32).cuda(), y["fake_amp"].type(torch.float32).cuda(), y["trg_amp"].type(torch.float32).cuda(), y["src_amp"].type(torch.float32).cuda()], './demo_images/'+"src_"+str(start_iter)+'.png')
+            #save_image([(label["image"]/255).type(torch.float32) for label in label_data],'./demo_images/'+"src_"+str(start_iter)+'.png')
+            #save_image([label["image"].type(torch.float32) for label in src_in_trg],'./demo_images/'+"src_to_target_"+str(start_iter)+'.png')
         self.optimizer_unet.zero_grad()
+        loss_darkness = torch.sum(torch.tensor([criterion_cycle(x["image"], torch.zeros_like(x["image"])) for x in src_in_trg], requires_grad=True))
         #Consistency Loss
-        loss_consistency_fda = torch.sum(torch.tensor([criterion_cycle(x["image"], y["image"]) for x, y in zip(src_in_trg, label_data)], requires_grad=True))
-        loss_consistency_fda_amp = torch.sum(torch.tensor([criterion_cycle(x["src_amp"], x["fake_amp"]) for x in src_in_trg], requires_grad=True))
+        loss_consistency_fda = torch.sum(torch.tensor([criterion_cycle(x["image"], y["image"]/255) for x, y in zip(src_in_trg, label_data)], requires_grad=True))
+        loss_consistency_fda_amp = torch.sum(torch.tensor([criterion_cycle(x["trg_amp"], x["fake_amp"]) for x in src_in_trg], requires_grad=True))
         discriminator_img_out_t_faked = [self.discriminator(torch.unsqueeze(x["image"], 0).cuda()) for x in src_in_trg]#[self.discriminator(x) for x in src_in_trg]
         loss_discriminator_t_faked = torch.sum(torch.tensor([F.binary_cross_entropy_with_logits(z, torch.FloatTensor(z.data.size()).fill_(target_label).cuda()) for z in discriminator_img_out_t_faked], requires_grad=True))
         
+        loss_darkness.backward()
         loss_consistency_fda.backward()
         loss_consistency_fda_amp.backward()
         loss_discriminator_t_faked.backward()
+        
         self.optimizer_unet.step()
         
         self.optimizer_D_A.zero_grad()
@@ -347,6 +355,7 @@ class TwoPCTrainer(DefaultTrainer):
         self.optimizer_D_A.step()
         
         temp_dict = {
+                'loss_darkness': loss_darkness,
                 'loss_consistency_fda': loss_consistency_fda,
                 'loss_consistency_fda_amp': loss_consistency_fda_amp,
                 'loss_discriminator_t_faked': loss_discriminator_t_faked,
