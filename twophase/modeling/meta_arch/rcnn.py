@@ -30,7 +30,7 @@ class Discriminator(nn.Module):
             layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
             if normalize:
                 layers.append(nn.InstanceNorm2d(out_filters))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            layers.append(nn.LeakyReLU(0.2, inplace=False))
             return layers
         
         self.model = nn.Sequential(
