@@ -243,10 +243,10 @@ def FDA_source_to_target_unet(src_img, trg_img, unet_model, start_iter, L=0.01):
     # print("fft_src_in_trg: "+str(fft_src_in_trg.requires_grad))
     
     
-    amp_src_in_trg, pha_src_in_trg = extract_ampl_phase( fft_src_in_trg.clone()) 
+    amp_src_in_trg, pha_src_in_trg = extract_ampl_phase( fft_src_in_trg.cuda()) 
     # print("amp_src_in_trg: "+str(amp_src_in_trg.requires_grad))
     # print("pha_src_in_trg: "+str(pha_src_in_trg.requires_grad))
-    
+    org_pha_in_src = pha_src_in_trg.cuda()
     
     pha_src_in_trg = (pha_src_in_trg - pha_src_in_trg.min()) / (pha_src_in_trg.max() - pha_src_in_trg.min())
     amp_src_in_trg = (amp_src_in_trg - amp_src_in_trg.min()) / (amp_src_in_trg.max() - amp_src_in_trg.min())
@@ -262,12 +262,31 @@ def FDA_source_to_target_unet(src_img, trg_img, unet_model, start_iter, L=0.01):
     fft_y_org.requires_grad_()
     # print("fft_y_org: "+str(fft_y_org.requires_grad))
     
+    fft_z_org = amp_src * torch.exp(1j * org_pha_in_src)
+    fft_z_org.requires_grad_()
+    
+    fft_D_org = amp_trg * torch.exp(1j * org_pha_in_src)
+    fft_D_org.requires_grad_()
+    
     _, imgH, imgW = src_img.size()
     src_org = torch.fft.irfft2(fft_y_org.cuda(), dim=(-2, -1), s=[imgH, imgW])
     src_org.requires_grad_()
     # print("src_org: "+str(src_org.requires_grad))
     
     src_org = (src_org - src_org.min()) / (src_org.max() - src_org.min())
+    
+    src_pha_org = torch.fft.irfft2(fft_z_org.cuda(), dim=(-2, -1), s=[imgH, imgW])
+    src_pha_org.requires_grad_()
+    # print("src_org: "+str(src_org.requires_grad))
+    
+    src_pha_org = (src_pha_org - src_pha_org.min()) / (src_pha_org.max() - src_pha_org.min())
+    
+    _, imgH, imgW = src_img.size()
+    D_gen = torch.fft.irfft2(fft_D_org.cuda(), dim=(-2, -1), s=[imgH, imgW])
+    D_gen.requires_grad_()
+    # print("src_org: "+str(src_org.requires_grad))
+    
+    D_gen = (D_gen - D_gen.min()) / (D_gen.max() - D_gen.min())
     
     result_map = {
         "image": src_org.cuda(),
@@ -278,6 +297,8 @@ def FDA_source_to_target_unet(src_img, trg_img, unet_model, start_iter, L=0.01):
         "pha_fake": pha_src_in_trg.cuda(),
         "pha_src": pha_src.cuda(),
         "trg_img": trg_img,
+        "src_pha_org": src_pha_org.cuda(),
+        "D_gen": D_gen.cuda()
     }
     return result_map
 
@@ -293,6 +314,8 @@ def unet_helper(src_in_trg):
     # print("src_in_trg: "+str(src_in_trg.requires_grad))
         
     src_in_trg = torch.nn.functional.interpolate(src_in_trg.unsqueeze(0), size=(600, 1067)).squeeze().cuda()
+    src_in_trg = (src_in_trg - src_in_trg.min()) / (src_in_trg.max() - src_in_trg.min())
+    
     return src_in_trg
 
 def FDA_output(src_img, trg_img):
