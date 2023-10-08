@@ -76,3 +76,12 @@ class NightAug:
 
             sample['image'] = img.cpu()
         return x
+    
+    
+    def unet_aug(self,x):
+        for sample in x:
+            
+            #need change to 255 range later
+
+            sample['image'] = img.cpu()
+        return x
