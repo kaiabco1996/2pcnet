@@ -253,9 +253,9 @@ class TwoPCTrainer(DefaultTrainer):
 
     def train(self):
         self.train_loop(self.start_iter, self.max_iter)
-        # if hasattr(self, "_last_eval_results") and comm.is_main_process():
-        #     verify_results(self.cfg, self._last_eval_results)
-        #     return self._last_eval_results
+        if hasattr(self, "_last_eval_results") and comm.is_main_process():
+            verify_results(self.cfg, self._last_eval_results)
+            return self._last_eval_results
 
     def train_loop(self, start_iter: int, max_iter: int):
         logger = logging.getLogger(__name__)
@@ -267,8 +267,6 @@ class TwoPCTrainer(DefaultTrainer):
         with EventStorage(start_iter) as self.storage:
             try:
                 self.before_train()
-                self.unet_model.train()
-                #self.discriminator.train()
 
                 for self.iter in range(start_iter, max_iter):
                     self.before_step()
@@ -691,10 +689,10 @@ class TwoPCTrainer(DefaultTrainer):
             record_dict, _, _, _ = self.model(
                 label_data, branch="supervised")
             
-            if start_iter >5000:
+            if start_iter > 5000:
                 record_dict_night, _, _, _ = self.model(
                     label_data_aug, branch="supervised")
-                
+            
                 temp_dict = {}
                 for key in record_dict_night.keys():
                     temp_dict[key+'_night'] = record_dict_night[key]
@@ -843,20 +841,20 @@ class TwoPCTrainer(DefaultTrainer):
             cons_loss = self.consistency_losses.losses(roi_stu,roi_teach)
             record_dict.update(cons_loss)
 
-        # weight losses
-        loss_dict = {}
-        for key in record_dict.keys():
-            if key.startswith("loss"):
-                if key == "loss_rpn_loc_pseudo": 
-                    loss_dict[key] = record_dict[key] * 0
-                elif key.endswith('loss_cls_pseudo'):
-                    loss_dict[key] = record_dict[key] * self.cfg.SEMISUPNET.UNSUP_LOSS_WEIGHT
-                elif key.endswith('loss_rpn_cls_pseudo'):
-                    loss_dict[key] = record_dict[key] 
-                else: 
-                    loss_dict[key] = record_dict[key] * 1
+            # weight losses
+            loss_dict = {}
+            for key in record_dict.keys():
+                if key.startswith("loss"):
+                    if key == "loss_rpn_loc_pseudo": 
+                        loss_dict[key] = record_dict[key] * 0
+                    elif key.endswith('loss_cls_pseudo'):
+                        loss_dict[key] = record_dict[key] * self.cfg.SEMISUPNET.UNSUP_LOSS_WEIGHT
+                    elif key.endswith('loss_rpn_cls_pseudo'):
+                        loss_dict[key] = record_dict[key] 
+                    else: 
+                        loss_dict[key] = record_dict[key] * 1
 
-        losses = sum(loss_dict.values())
+            losses = sum(loss_dict.values())
 
         metrics_dict = record_dict
         metrics_dict["data_time"] = data_time
