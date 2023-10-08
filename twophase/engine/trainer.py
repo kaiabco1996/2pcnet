@@ -3,11 +3,15 @@ import time
 import logging
 import json
 import torch
+import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 from fvcore.nn.precise_bn import get_bn_modules
 import numpy as np
 from collections import OrderedDict
 import torchvision.transforms as T
+from torch.nn import functional as F
+from FDA.utils import FDA_source_to_target_unet, unet_helper
+import torchvision.transforms as transforms
 
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
@@ -23,6 +27,9 @@ from detectron2.structures.boxes import Boxes
 from detectron2.structures.instances import Instances
 from detectron2.utils.env import TORCH_VERSION
 from detectron2.data import MetadataCatalog
+import segmentation_models_pytorch as smp
+from twophase.modeling.meta_arch.rcnn import FCDiscriminator_img
+from twophase.modeling.meta_arch.rcnn import Discriminator
 
 from twophase.data.build import (
     build_detection_semisup_train_loader,
@@ -37,6 +44,7 @@ from twophase.solver.build import build_lr_scheduler
 from twophase.evaluation import PascalVOCDetectionEvaluator, COCOEvaluator
 from twophase.modeling.custom_losses import ConsistencyLosses
 from twophase.data.transforms.night_aug import NightAug
+from torchvision.utils import save_image
 import copy
 
 # Adaptive Teacher Trainer
@@ -58,6 +66,11 @@ class TwoPCTrainer(DefaultTrainer):
         # create an teacher model
         model_teacher = self.build_model(cfg)
         self.model_teacher = model_teacher
+        
+        self.unet_model = smp.Unet('resnet101', encoder_weights='imagenet', classes=6, activation=None, encoder_depth=5, decoder_channels=[256, 128, 64, 32, 16]).cuda()
+        unet_checkpoint_path = './output/bdd100k_unet/Unet_NightDA25000.pth'
+        unet_checkpoint = torch.load(unet_checkpoint_path)
+        self.unet_model.load_state_dict(unet_checkpoint)
 
         # For training, wrap with DDP. But don't need this for inference.
         if comm.get_world_size() > 1:
@@ -271,9 +284,29 @@ class TwoPCTrainer(DefaultTrainer):
         data_time = time.perf_counter() - start
 
         # Add NightAug images into supervised batch
-        if self.cfg.NIGHTAUG:
-            label_data_aug = self.night_aug.aug([x.copy() for x in label_data])
-            label_data.extend(label_data_aug)
+        # if self.cfg.NIGHTAUG:
+        #     label_data_aug = self.night_aug.aug([x.copy() for x in label_data])
+        #     label_data.extend(label_data_aug)
+        if self.cfg.NIGHTAUG and self.iter > 5000:
+            #label_data_aug = self.night_aug.aug([x.copy() for x in label_data])
+            with torch.no_grad():
+                src_in_trg = [FDA_source_to_target_unet(x["image"], y["image"], self.unet_model, self.iter) for x, y in zip(label_data, unlabel_data)]
+                label_data_aug = []
+                for x,y in zip(label_data, src_in_trg):
+                    z = x.copy()
+                    #z['image'] = (x['image'].cuda() + (y['src_org'].cuda())*255)/2
+                    #label_data_aug.append(z)
+                    #print(x['image'].shape)
+                    #print(y['image'].shape)
+                    rgb_img_tensor = torch.mean(torch.stack((((x["image"]/255)*0.5).unsqueeze(0).cuda(), (y["src_org"]).unsqueeze(0))), dim=0)
+                    #print(rgb_img_tensor.shape)
+                    z['image'] = rgb_img_tensor.squeeze()
+                    #print(rgb_img_tensor.shape)
+                    #print(z['image'].shape)
+                    label_data_aug.append(z)
+                    rgb_img_tensor = rgb_img_tensor[:, [2, 1, 0], :, :]
+                    #save_image(rgb_img_tensor,'./demo_images/'+"test_"+str(start_iter)+'.png')
+                #label_data.extend(label_data_aug)
             
 
         # burn-in stage (supervised training with labeled data)
