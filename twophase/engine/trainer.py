@@ -28,8 +28,7 @@ from detectron2.structures.instances import Instances
 from detectron2.utils.env import TORCH_VERSION
 from detectron2.data import MetadataCatalog
 import segmentation_models_pytorch as smp
-from twophase.modeling.meta_arch.rcnn import FCDiscriminator_img
-from twophase.modeling.meta_arch.rcnn import Discriminator
+
 
 from twophase.data.build import (
     build_detection_semisup_train_loader,
@@ -287,26 +286,23 @@ class TwoPCTrainer(DefaultTrainer):
         # if self.cfg.NIGHTAUG:
         #     label_data_aug = self.night_aug.aug([x.copy() for x in label_data])
         #     label_data.extend(label_data_aug)
-        if self.cfg.NIGHTAUG and self.iter > 5000:
+        if self.cfg.NIGHTAUG:
             #label_data_aug = self.night_aug.aug([x.copy() for x in label_data])
-            with torch.no_grad():
-                src_in_trg = [FDA_source_to_target_unet(x["image"], y["image"], self.unet_model, self.iter) for x, y in zip(label_data, unlabel_data)]
+            if self.iter > 10000:
                 label_data_aug = []
-                for x,y in zip(label_data, src_in_trg):
-                    z = x.copy()
-                    #z['image'] = (x['image'].cuda() + (y['src_org'].cuda())*255)/2
-                    #label_data_aug.append(z)
-                    #print(x['image'].shape)
-                    #print(y['image'].shape)
-                    rgb_img_tensor = torch.mean(torch.stack((((x["image"]/255)*0.5).unsqueeze(0).cuda(), (y["src_org"]).unsqueeze(0))), dim=0)
-                    #print(rgb_img_tensor.shape)
-                    z['image'] = rgb_img_tensor.squeeze()
-                    #print(rgb_img_tensor.shape)
-                    #print(z['image'].shape)
-                    label_data_aug.append(z)
-                    rgb_img_tensor = rgb_img_tensor[:, [2, 1, 0], :, :]
-                    #save_image(rgb_img_tensor,'./demo_images/'+"test_"+str(start_iter)+'.png')
-                #label_data.extend(label_data_aug)
+                with torch.no_grad():
+                    src_in_trg = [FDA_source_to_target_unet(x["image"], y["image"], self.unet_model, self.iter) for x, y in zip(label_data, unlabel_data)]
+                    for x,y in zip(label_data, src_in_trg):
+                        z = x.copy()
+                        rgb_img_tensor = torch.mean(torch.stack((((x["image"]/255)*(0.5-(0.5*min(1.0,(self.iter/100000))))).unsqueeze(0).cuda(), (y["src_org"]).unsqueeze(0))), dim=0)
+                        z['image'] = (rgb_img_tensor.squeeze().cpu())*255
+                        label_data_aug.append(z)
+                        #rgb_img_tensor = rgb_img_tensor[:, [2, 1, 0], :, :]
+                        if (self.iter % 500 == 0):
+                            save_image(rgb_img_tensor,'./demo_images/'+"test_"+str(self.iter)+'.png')
+            else:
+                label_data_aug = self.night_aug.aug([x.copy() for x in label_data])
+            label_data.extend(label_data_aug)
             
 
         # burn-in stage (supervised training with labeled data)
@@ -315,13 +311,13 @@ class TwoPCTrainer(DefaultTrainer):
             record_dict, _, _, _ = self.model(
                 label_data, branch="supervised")
             
-            record_dict_night, _, _, _ = self.model(
-                unlabel_data, branch="supervised")
+            # record_dict_night, _, _, _ = self.model(
+            #     unlabel_data, branch="supervised")
              
-            temp_dict = {}
-            for key in record_dict_night.keys():
-                 temp_dict[key+'_night'] = record_dict_night[key]
-            record_dict.update(temp_dict)
+            # temp_dict = {}
+            # for key in record_dict_night.keys():
+            #      temp_dict[key+'_night'] = record_dict_night[key]
+            # record_dict.update(temp_dict)
             
             # weight losses
             loss_dict = {}
