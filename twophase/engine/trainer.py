@@ -67,7 +67,17 @@ class L_TV(nn.Module):
             h_tv = torch.pow(torch.clamp(self.mid_val - torch.abs(torch.abs(x[:,:,1:,:]-x[:,:,:h_x-1,:]) - self.mid_val), 0, 1), 2).sum()
             w_tv = torch.pow(torch.clamp(self.mid_val - torch.abs(torch.abs(x[:,:,:,1:]-x[:,:,:,:w_x-1]) - self.mid_val), 0, 1), 2).sum()
         return 2 * (h_tv/count_h+w_tv/count_w)/batch_size
+class WeightedLoss(torch.nn.Module):
+    def __init__(self, weight_map):
+        super(WeightedLoss, self).__init__()
+        self.weight_map = weight_map
 
+    def forward(self, generated_image, target_image):
+        generated_image = torch.mean(generated_image.type(torch.float32), dim=0, keepdim=True)
+        target_image = torch.mean(target_image.type(torch.float32), dim=0, keepdim=True)
+        
+        loss = torch.nn.L1Loss().cuda()(generated_image, target_image) * self.weight_map
+        return loss.mean()
 class L_color(nn.Module):
 
     def __init__(self):
@@ -127,7 +137,7 @@ class TwoPCTrainer(DefaultTrainer):
         model_teacher = self.build_model(cfg)
         self.model_teacher = model_teacher
         
-        self.unet_model = smp.Unet('resnet101', encoder_weights='imagenet', classes=6, activation=None, encoder_depth=5, decoder_channels=[256, 128, 64, 32, 16]).cuda()
+        self.unet_model = smp.Unet('resnet101', encoder_weights='imagenet', classes=3, activation=None, encoder_depth=5, decoder_channels=[256, 128, 64, 32, 16]).cuda()
         max_lr = 0.010#1e-3
         epoch = 15
         weight_decay = 1e-4#1e-4
@@ -523,7 +533,18 @@ class TwoPCTrainer(DefaultTrainer):
                 save_image([rgb_img_tensor.squeeze().type(torch.float32).cuda(),rgb_img_tensor_2.squeeze().type(torch.float32).cuda(), avg_img_tensor.squeeze().type(torch.float32).cuda(), rgb_img_tensor_6.squeeze().type(torch.float32).cuda(), rgb_img_tensor_4.squeeze().type(torch.float32).cuda(), rgb_img_tensor_5.squeeze().type(torch.float32).cuda(), rgb_img_tensor_7.squeeze().type(torch.float32).cuda()], './demo_images/'+"src_"+str(start_iter)+'.png')
             #save_image([(label["image"]/255).type(torch.float32) for label in label_data],'./demo_images/'+"src_"+str(start_iter)+'.png')
             #save_image([label["image"].type(torch.float32) for label in src_in_trg],'./demo_images/'+"src_to_target_"+str(start_iter)+'.png')
-        loss_darkness = (torch.sum(torch.stack([criterion_cycle(x["src_org"], torch.zeros_like(x["image"])).cuda() for x in src_in_trg]).cuda())).cuda()
+        # test_img = torch.mean(label_data[0]["image"].type(torch.float32), dim=0, keepdim=True)
+        # weight_map = torch.ones_like(test_img) * 0.5
+        # weight_map[test_img > 0.5] = 1.0
+        # weight_map[test_img > 0.8] = 1.0
+        # weight_map[test_img < 0.1] = 0
+        
+
+        # # Create a weighted loss function
+        # weighted_loss = WeightedLoss(weight_map.cuda())
+        #loss_darkness = (torch.sum(torch.stack([weighted_loss(x["src_org"], torch.zeros_like(y["image"]).cuda()).cuda() for x,y in zip(src_in_trg,unlabel_data)]).cuda())).cuda()
+        loss_darkness = (torch.sum(torch.stack([criterion_cycle(x["src_org"], torch.zeros_like(x["src_org"]).cuda()).cuda() for x in src_in_trg]).cuda())).cuda()
+        
         #loss_darkness = (torch.sum(torch.stack([criterion_cycle(x["src_org"], (y["image"]/255).cuda()).cuda() for x,y in zip(src_in_trg, unlabel_data)]).cuda())).cuda()
         
         # loss_darkness = torch.sum(torch.stack(
@@ -566,10 +587,10 @@ class TwoPCTrainer(DefaultTrainer):
             [self.edge_loss(
                 torch.unsqueeze(torch.mean((input_image["image"]/255).type(torch.float32).cuda(), dim=0, keepdim=True),0), 
                 torch.unsqueeze(torch.mean(output_image["image"].type(torch.float32).cuda(), dim=0, keepdim=True),0)) 
-             for input_image, output_image in zip(label_data, src_in_trg)]))*90
+             for input_image, output_image in zip(label_data, src_in_trg)]))*10
         
         # print("loss_discriminator_t_faked: "+str(loss_discriminator_t_faked.requires_grad))
-        loss_gen = (loss_discriminator_t_faked)+(loss_darkness*loss_discriminator_t_faked)+loss_variation_org+loss_color_consistency+loss_edge#+(loss_edge)#+loss_color_reg+loss_color_consistency#+(loss_discriminator_t_faked_pha/5)#+loss_variation_org##+(loss_edge)#+loss_color_org+loss_variation_org#+loss_consistency_amp#+loss_consistency_fda#+loss_consistency_phase
+        loss_gen = (loss_discriminator_t_faked)+(loss_darkness*loss_discriminator_t_faked)+loss_variation_org+loss_edge+loss_color_consistency#+loss_consistency_fda#+(loss_edge)#+loss_color_reg+loss_color_consistency#+(loss_discriminator_t_faked_pha/5)#+loss_variation_org##+(loss_edge)#+loss_color_org+loss_variation_org#+loss_consistency_amp#+loss_consistency_fda#+loss_consistency_phase
         #loss_darkness.backward()
         #loss_consistency_fda.backward()
         #loss_consistency_fda_amp.backward()
@@ -635,7 +656,7 @@ class TwoPCTrainer(DefaultTrainer):
                 #'loss_target_consistency': loss_target_consistency,
                 'loss_color_consistency': loss_color_consistency,
                 'loss_variation_org': loss_variation_org,
-                'loss_edge': loss_edge,
+                #'loss_edge': loss_edge,
                 #'loss_consistency_fda': loss_consistency_fda,
                 # 'loss_consistency_fda_amp': loss_consistency_fda_amp,
                 #'loss_consistency_amp': loss_consistency_amp,

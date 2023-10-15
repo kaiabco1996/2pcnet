@@ -222,16 +222,16 @@ def FDA_source_to_target_unet(src_img, trg_img, unet_model, start_iter, L=0.01):
     # print("amp_fusion: "+str(amp_fusion.requires_grad))
     
     src_in_trg = unet_model(amp_fusion.cuda()).cuda()    
-    # print("src_in_trg: "+str(src_in_trg.requires_grad))
+    # print("src_in_trg 1: "+str(src_in_trg.shape))
     src_in_trg = torch.mean(src_in_trg, dim=0)
-    # print("src_in_trg: "+str(src_in_trg.requires_grad))
-    split_tensors = torch.split(src_in_trg, 2, dim=0)
+    # print("src_in_trg 2: "+str(src_in_trg.shape))
+    split_tensors = torch.split(src_in_trg, 1, dim=0)
     # print("split_tensors: "+str(split_tensors[0].requires_grad))
     
     mean_tensors = [torch.mean(split_tensor, dim=0) for split_tensor in split_tensors]
-    # print("mean_tensors[0]: "+str(mean_tensors[0].requires_grad))
+    #print("mean_tensors[0]: "+str(mean_tensors[0].shape))
     src_in_trg = torch.stack(mean_tensors, dim=0)
-    # print("src_in_trg: "+str(src_in_trg.requires_grad))
+    # print("src_in_trg: "+str(src_in_trg.shape))
     
         
     src_in_trg = torch.nn.functional.interpolate(src_in_trg.unsqueeze(0), size=(600, 1067)).squeeze().cuda()
