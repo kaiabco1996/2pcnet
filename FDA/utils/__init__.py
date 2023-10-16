@@ -225,7 +225,7 @@ def FDA_source_to_target_unet(src_img, trg_img, unet_model, start_iter, L=0.01):
     # print("src_in_trg: "+str(src_in_trg.requires_grad))
     src_in_trg = torch.mean(src_in_trg, dim=0)
     # print("src_in_trg: "+str(src_in_trg.requires_grad))
-    split_tensors = torch.split(src_in_trg, 2, dim=0)
+    split_tensors = torch.split(src_in_trg, 1, dim=0)
     # print("split_tensors: "+str(split_tensors[0].requires_grad))
     
     mean_tensors = [torch.mean(split_tensor, dim=0) for split_tensor in split_tensors]

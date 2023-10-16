@@ -66,8 +66,8 @@ class TwoPCTrainer(DefaultTrainer):
         model_teacher = self.build_model(cfg)
         self.model_teacher = model_teacher
         
-        self.unet_model = smp.Unet('resnet101', encoder_weights='imagenet', classes=6, activation=None, encoder_depth=5, decoder_channels=[256, 128, 64, 32, 16]).cuda()
-        unet_checkpoint_path = './output/bdd100k_unet/Unet_NightDA25000.pth'
+        self.unet_model = smp.Unet('resnet101', encoder_weights='imagenet', classes=3, activation=None, encoder_depth=5, decoder_channels=[256, 128, 64, 32, 16]).cuda()
+        unet_checkpoint_path = './output/bdd100k_unet/Unet_NightDA15000.pth'
         unet_checkpoint = torch.load(unet_checkpoint_path)
         self.unet_model.load_state_dict(unet_checkpoint)
 
@@ -294,7 +294,7 @@ class TwoPCTrainer(DefaultTrainer):
                     src_in_trg = [FDA_source_to_target_unet(x["image"], y["image"], self.unet_model, self.iter) for x, y in zip(label_data, unlabel_data)]
                     for x,y in zip(label_data, src_in_trg):
                         z = x.copy()
-                        rgb_img_tensor = torch.mean(torch.stack((((x["image"]/255)*(0.5-(0.5*min(1.0,(self.iter/100000))))).unsqueeze(0).cuda(), (y["src_org"]).unsqueeze(0))), dim=0)
+                        rgb_img_tensor = torch.mean(torch.stack((((x["image"]/255)*0.20).unsqueeze(0).cuda(), (y["src_org"]).unsqueeze(0))), dim=0)
                         z['image'] = (rgb_img_tensor.squeeze().cpu())*255
                         label_data_aug.append(z)
                         #rgb_img_tensor = rgb_img_tensor[:, [2, 1, 0], :, :]
