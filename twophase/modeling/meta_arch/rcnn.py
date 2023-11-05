@@ -16,6 +16,27 @@ from detectron2.utils.events import get_event_storage
 from detectron2.structures import ImageList
 
 #######################
+class MLP(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim=1024, num_hidden_layers=4):
+        super(MLP, self).__init__()
+        self.flatten = nn.Flatten()
+        self.layers = nn.ModuleList()
+        
+        # Input layer
+        self.layers.append(nn.Linear(input_dim, hidden_dim))
+        
+        # Hidden layers
+        for _ in range(num_hidden_layers - 1):
+            self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+        
+        # Output layer
+        self.layers.append(nn.Linear(hidden_dim, output_dim))
+    
+    def forward(self, x):
+        x = self.flatten(x)
+        for layer in self.layers:
+            x = nn.functional.relu(layer(x))
+        return x
 class Discriminator(nn.Module):
     def __init__(self, input_shape):
         super(Discriminator, self).__init__()

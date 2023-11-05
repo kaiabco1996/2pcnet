@@ -29,7 +29,7 @@ from detectron2.utils.env import TORCH_VERSION
 from detectron2.data import MetadataCatalog
 import segmentation_models_pytorch as smp
 from twophase.modeling.meta_arch.rcnn import FCDiscriminator_img
-from twophase.modeling.meta_arch.rcnn import Discriminator
+from twophase.modeling.meta_arch.rcnn import Discriminator, MLP
 
 
 
@@ -98,7 +98,11 @@ class LambdaLR:
 
 # Adaptive Teacher Trainer
 class TwoPCTrainer(DefaultTrainer):
-    
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.zeros_(m.bias)
+        
     def weights_init_normal(self, m):
         classname = m.__class__.__name__
         if classname.find('Conv') != -1:
@@ -127,7 +131,7 @@ class TwoPCTrainer(DefaultTrainer):
         model_teacher = self.build_model(cfg)
         self.model_teacher = model_teacher
         
-        self.unet_model = smp.Unet('resnet101', encoder_weights='imagenet', classes=6, activation=None, encoder_depth=5, decoder_channels=[256, 128, 64, 32, 16]).cuda()
+        self.unet_model = smp.Unet('mobilenet_v2', encoder_weights='imagenet',decoder_attention_type="scse", classes=6, activation=None, encoder_depth=5, decoder_channels=[256, 128, 64, 32, 16]).cuda()
         max_lr = 0.010#1e-3
         epoch = 15
         weight_decay = 1e-4#1e-4
@@ -149,6 +153,9 @@ class TwoPCTrainer(DefaultTrainer):
                             self.optimizer_D_A,
                             lr_lambda=LambdaLR(n_epochs, epoch, decay_epoch).step
                         )
+        self.mlp_fourier_disc = MLP(3*600*1067, 1)
+        self.mlp_fourier_disc.apply(self.init_weights)
+        self.optimizer_mlp = torch.optim.Adam(self.mlp_fourier_disc.parameters(), lr=0.001) 
         
 
         # For training, wrap with DDP. But don't need this for inference.
@@ -489,6 +496,7 @@ class TwoPCTrainer(DefaultTrainer):
         # self.optimizer_unet.step()
         
         self.optimizer_unet.zero_grad()
+        self.optimizer_mlp.zero_grad()
         # self.print_gradients(self.unet_model)
         
         # Print the weights of the first layer
