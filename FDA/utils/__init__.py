@@ -4,6 +4,7 @@ import torchvision.transforms as transforms
 from torchvision.transforms.functional import center_crop
 from torchvision.utils import save_image
 from torchvision.transforms import Resize
+from collections import namedtuple
 
 def extract_ampl_phase(fft_im):
     # fft_im: size should be bx3xhxwx2
@@ -12,6 +13,16 @@ def extract_ampl_phase(fft_im):
     #fft_pha = torch.atan2( fft_im[:,:,:,:,1], fft_im[:,:,:,:,0] )
     fft_pha = torch.angle(fft_im)
     return fft_amp, fft_pha
+
+def visual_ampl_phase(fft_im):
+    # fft_im: size should be bx3xhxwx2
+    fft_shifted = torch.fft.fftshift(fft_im)
+    fft_amp = torch.abs(fft_shifted)#fft_im[:,:,:,:,0]**2 + fft_im[:,:,:,:,1]**2
+    fft_log_amp = torch.log(fft_amp)
+    #fft_amp = torch.sqrt(fft_amp)
+    #fft_pha = torch.atan2( fft_im[:,:,:,:,1], fft_im[:,:,:,:,0] )
+    fft_pha = torch.angle(fft_shifted)
+    return fft_log_amp, fft_pha
 
 def gaussian_heatmap(x,y,sig):
     """
@@ -148,44 +159,147 @@ def low_freq_mutate_np( amp_src, amp_trg, L=0.1 ):
 #     src_in_trg = (src_in_trg.clone().detach() - outmap_min) / (outmap_max - outmap_min)
 #     return src_in_trg
 
-# def FDA_source_to_target(src_img, trg_img, L=0.01):
-#     # exchange magnitude
-#     # input: src_img, trg_img
-#     #print('PROCESS')
-#     #print(src_img.shape)
-#     if not torch.is_tensor(src_img):
-#         #print('PROCESSTORCH')
-#         src_img = torch.from_numpy(src_img)
-#     if not torch.is_tensor(trg_img):
-#         #print('PROCESSTORCH')
-#         trg_img = torch.from_numpy(trg_img)
+def combine_fourier_images(image_1, image_2, low_pass_filter_radius, high_pass_filter_radius):
+    """
+    Combines two images in the Fourier domain.
 
-#     # get fft of both source and target
-#     #print('PROCESS2')
-#     fft_src = torch.fft.fft2( src_img.cuda(), dim=(-2, -1)).cuda()
-#     fft_trg = torch.fft.fft2( trg_img.cuda(), dim=(-2, -1)).cuda()
+    Args:
+        image_1: A PyTorch tensor of shape (C, H, W) containing the first image.
+        image_2: A PyTorch tensor of shape (C, H, W) containing the second image.
+        low_pass_filter_radius: The radius of the low pass filter.
+        high_pass_filter_radius: The radius of the high pass filter.
 
-#     # extract amplitude and phase of both ffts
-#     #print('PROCESS3')
-#     amp_src, pha_src = extract_ampl_phase( fft_src.clone())
-#     amp_trg, pha_trg = extract_ampl_phase( fft_trg.clone())
+    Returns:
+        A PyTorch tensor of shape (C, H, W) containing the combined image.
+    """
+
+    # Fourier transform the images
+    image_1_fft = torch.fft.fft2( image_1.cuda(), dim=(-2, -1)).cuda()
+    image_2_fft = torch.fft.fft2( image_2.cuda(), dim=(-2, -1)).cuda()
+
+    # Create low pass and high pass filters
+    # low_pass_filter = create_low_pass_filter(image_1_fft, low_pass_filter_radius)
+    # high_pass_filter = create_high_pass_filter(image_1_fft, high_pass_filter_radius)
+    # Define low-pass and high-pass filters in the frequency domain
+    shape = image_1.shape[-2:]
+    low_filter = np.zeros(shape)
+    high_filter = np.ones(shape)
+
+    # Create low-pass filter
+    low_filter[:low_pass_filter_radius, :low_pass_filter_radius] = 1
+    low_filter[-low_pass_filter_radius:, :low_pass_filter_radius] = 1
+    low_filter[:low_pass_filter_radius, -low_pass_filter_radius:] = 1
+    low_filter[-low_pass_filter_radius:, -low_pass_filter_radius:] = 1
+
+    # Create high-pass filter
+    high_filter[:high_pass_filter_radius, :high_pass_filter_radius] = 0
+    high_filter[-high_pass_filter_radius:, :high_pass_filter_radius] = 0
+    high_filter[:high_pass_filter_radius, -high_pass_filter_radius:] = 0
+    high_filter[-high_pass_filter_radius:, -high_pass_filter_radius:] = 0
+
+    low_filter = torch.tensor(low_filter, dtype=torch.float32)
+    high_filter = torch.tensor(high_filter, dtype=torch.float32)
+
+    # Apply the filters
+    low_pass_filtered_image_1_fft = image_1_fft * low_filter.cuda()
+    high_pass_filtered_image_2_fft = image_2_fft * high_filter.cuda()
+
+    # Combine the filtered images in the Fourier domain
+    combined_image_fft = low_pass_filtered_image_1_fft + high_pass_filtered_image_2_fft
+
+    # Inverse Fourier transform the combined image
+    _, imgH, imgW = image_1.size()
+    combined_image = torch.fft.irfft2(combined_image_fft, dim=(-2, -1), s=[imgH, imgW])
+    combined_image = torch.tensor(combined_image.cpu().detach().numpy(), requires_grad=True)
+
+    return combined_image
+
+def create_low_pass_filter(image, radius):
+    """
+    Creates a low pass filter in the Fourier domain.
+
+    Args:
+        image_width: the image.
+        radius: The radius of the low pass filter.
+
+    Returns:
+        A PyTorch tensor of shape (image_width, image_width) containing the low pass filter.
+    """
+
+    low_pass_filter = torch.zeros((image.shape[1], image.shape[2]))
+    low_pass_filter[0, :] = 1
+    low_pass_filter[:, 0] = 1
+    low_pass_filter = torch.fft.ifftshift(low_pass_filter)
+
+    for i in range(1, radius):
+        low_pass_filter[i, i] = 1
+        low_pass_filter[image.shape[1] - i, i] = 1
+        low_pass_filter[i, image.shape[2] - i] = 1
+        low_pass_filter[image.shape[1] - i, image.shape[2] - i] = 1
+
+    return low_pass_filter
+
+def create_high_pass_filter(image, radius):
+    """
+    Creates a high pass filter in the Fourier domain.
+
+    Args:
+        image_width: The image.
+        radius: The radius of the high pass filter.
+
+    Returns:
+        A PyTorch tensor of shape (image_width, image_width) containing the high pass filter.
+    """
+
+    high_pass_filter = torch.ones((image.shape[1], image.shape[2]))
+    high_pass_filter = torch.fft.ifftshift(high_pass_filter)
+
+    for i in range(1, radius):
+        high_pass_filter[i, i] = 0
+        high_pass_filter[image.shape[1] - i, i] = 0
+        high_pass_filter[i, image.shape[2] - i] = 0
+        high_pass_filter[image.shape[1] - i, image.shape[2] - i] = 0
+
+    return high_pass_filter
+
+def FDA_source_to_target(src_img, trg_img, L=0.01):
+    # exchange magnitude
+    # input: src_img, trg_img
+    #print('PROCESS')
+    #print(src_img.shape)
+    if not torch.is_tensor(src_img):
+        #print('PROCESSTORCH')
+        src_img = torch.from_numpy(src_img)
+    if not torch.is_tensor(trg_img):
+        #print('PROCESSTORCH')
+        trg_img = torch.from_numpy(trg_img)
+
+    # get fft of both source and target
+    #print('PROCESS2')
+    fft_src = torch.fft.fft2( src_img.cuda(), dim=(-2, -1)).cuda()
+    fft_trg = torch.fft.fft2( trg_img.cuda(), dim=(-2, -1)).cuda()
+
+    # extract amplitude and phase of both ffts
+    #print('PROCESS3')
+    amp_src, pha_src = extract_ampl_phase( fft_src.clone())
+    amp_trg, pha_trg = extract_ampl_phase( fft_trg.clone())
     
-#     # replace the low frequency amplitude part of source with that from target
-#     amp_src_ = low_freq_mutate( amp_src.clone(), amp_trg.clone(), L=L )
-#     #print(amp_src_)
-#     # recompose fft of source
-#     #fft_src_ = torch.zeros( fft_src.size(), dtype=torch.float )
-#     # real = torch.cos(pha_src.clone()) * amp_src_.clone()
-#     # imag = torch.sin(pha_src.clone()) * amp_src_.clone()
-#     # fft_y = torch.complex(real, imag)
-#     fft_y = amp_src_ * torch.exp(1j * pha_src)
-#     #print(fft_y.size())
-#     # get the recomposed image: source content, target style
-#     #_, imgH, imgW = src_img_tensor.size()
-#     _, imgH, imgW = src_img.size()
-#     src_in_trg = torch.fft.irfft2(fft_y, dim=(-2, -1), s=[imgH, imgW])
-#     src_in_trg = torch.tensor(src_in_trg.cpu().detach().numpy(), requires_grad=True)
-#     return src_in_trg\
+    # replace the low frequency amplitude part of source with that from target
+    amp_src_ = low_freq_mutate( amp_src.clone(), amp_trg.clone(), L=L )
+    #print(amp_src_)
+    # recompose fft of source
+    #fft_src_ = torch.zeros( fft_src.size(), dtype=torch.float )
+    # real = torch.cos(pha_src.clone()) * amp_src_.clone()
+    # imag = torch.sin(pha_src.clone()) * amp_src_.clone()
+    # fft_y = torch.complex(real, imag)
+    fft_y = amp_src_ * torch.exp(1j * pha_src)
+    #print(fft_y.size())
+    # get the recomposed image: source content, target style
+    #_, imgH, imgW = src_img_tensor.size()
+    _, imgH, imgW = src_img.size()
+    src_in_trg = torch.fft.irfft2(fft_y, dim=(-2, -1), s=[imgH, imgW])
+    src_in_trg = torch.tensor(src_in_trg.cpu().detach().numpy(), requires_grad=True)
+    return src_in_trg
     
 def FDA_source_to_target_unet(src_img, trg_img, unet_model, start_iter, L=0.01):
 
@@ -219,17 +333,22 @@ def FDA_source_to_target_unet(src_img, trg_img, unet_model, start_iter, L=0.01):
     trg_img_pad = transform(trg_img.cuda())
     amp_fusion = torch.unsqueeze(src_img_pad.cuda(), 0) #torch.cat((torch.unsqueeze(src_img_pad.cuda(), 0), torch.unsqueeze(trg_img_pad.cuda(), 0)), dim=0).cuda()
     amp_fusion.requires_grad_()
-    # print("amp_fusion: "+str(amp_fusion.requires_grad))
+    # # print("amp_fusion: "+str(amp_fusion.requires_grad))
+    # OPTIONS = namedtuple('OPTIONS', 'batch_size image_size \
+    #                           gf_dim df_dim output_c_dim is_training')
+    # options = OPTIONS._make((1, 1,
+    #                                   1, 1, 1,
+    #                                   True))
     
     src_in_trg = unet_model(amp_fusion.cuda()).cuda()    
     # print("src_in_trg 1: "+str(src_in_trg.shape))
     src_in_trg = torch.mean(src_in_trg, dim=0)
     # print("src_in_trg 2: "+str(src_in_trg.shape))
-    split_tensors = torch.split(src_in_trg, 1, dim=0)
+    split_tensors = torch.split(src_in_trg, 85, dim=0)
     # print("split_tensors: "+str(split_tensors[0].requires_grad))
     
     mean_tensors = [torch.mean(split_tensor, dim=0) for split_tensor in split_tensors]
-    #print("mean_tensors[0]: "+str(mean_tensors[0].shape))
+    # print("mean_tensors[0]: "+str(mean_tensors[0].shape))
     src_in_trg = torch.stack(mean_tensors, dim=0)
     # print("src_in_trg: "+str(src_in_trg.shape))
     
@@ -301,6 +420,157 @@ def FDA_source_to_target_unet(src_img, trg_img, unet_model, start_iter, L=0.01):
         "D_gen": D_gen.cuda()
     }
     return result_map
+
+def FDA_source_to_target_unet_2(src_img, trg_img, unet_model, start_iter, L=0.01):
+
+    transform = transforms.Pad([10, 4, 11, 4])
+    #transform_grey = transforms.Grayscale(num_output_channels=1)
+    if not torch.is_tensor(src_img):
+        src_img = torch.from_numpy(src_img)
+    if not torch.is_tensor(trg_img):
+        trg_img = torch.from_numpy(trg_img)
+
+    src_img = src_img.float()/255.0
+    trg_img = trg_img.float()/255.0
+    fft_src = torch.fft.fft2( src_img.cuda(), dim=(-2, -1), norm="ortho").cuda()    
+    fft_trg = torch.fft.fft2( trg_img.cuda(), dim=(-2, -1), norm="ortho").cuda()
+
+    amp_src, pha_src = visual_ampl_phase( fft_src.cuda())    
+    amp_trg, pha_trg = visual_ampl_phase( fft_trg.cuda())
+    amp_src.requires_grad_()
+    amp_trg.requires_grad_()
+    pha_src.requires_grad_()
+    pha_trg.requires_grad_()
+
+    amp_src = (amp_src - amp_src.min()) / (amp_src.max() - amp_src.min())
+    amp_trg = (amp_trg - amp_trg.min()) / (amp_trg.max() - amp_trg.min())
+    org_pha_src = pha_src.cuda()
+    org_pha_src.requires_grad_()
+    pha_src = (pha_src - pha_src.min()) / (pha_src.max() - pha_src.min())
+    pha_trg = (pha_trg - pha_trg.min()) / (pha_trg.max() - pha_trg.min())
+    
+    
+    
+    src_img_pad = transform(src_img.cuda())
+    # trg_img_pad = transform(trg_img.cuda())
+    src_img_pad = torch.unsqueeze(src_img_pad.cuda(), 0) #torch.cat((torch.unsqueeze(src_img_pad.cuda(), 0), torch.unsqueeze(trg_img_pad.cuda(), 0)), dim=0).cuda()
+    src_img_pad.requires_grad_()
+    # trg_img_pad = torch.unsqueeze(trg_img_pad.cuda(), 0) #torch.cat((torch.unsqueeze(src_img_pad.cuda(), 0), torch.unsqueeze(trg_img_pad.cuda(), 0)), dim=0).cuda()
+    # trg_img_pad.requires_grad_()
+    # # print("amp_fusion: "+str(amp_fusion.requires_grad))
+    # OPTIONS = namedtuple('OPTIONS', 'batch_size image_size \
+    #                           gf_dim df_dim output_c_dim is_training')
+    # options = OPTIONS._make((1, 1,
+    #                                   1, 1, 1,
+    #                                   True))
+    
+    src_in_trg = unet_model(src_img_pad.cuda()).cuda()    
+    #print("src_in_trg 1: "+str(src_in_trg.shape))
+    src_in_trg = postProcessFakeImg(src_in_trg)
+    #rint("src_in_trg 2: "+str(src_in_trg.shape))
+    
+    # print("src_in_trg: "+str(src_in_trg.requires_grad))
+    #src_in_trg = (src_in_trg - src_in_trg.min()) / (src_in_trg.max() - src_in_trg.min())
+    #src_in_trg = torch.nn.Sigmoid()(src_in_trg)
+    # print("src_in_trg: "+str(src_in_trg.requires_grad))
+    fft_src_in_trg = torch.fft.fft2( src_in_trg.cuda(), dim=(-2, -1), norm="ortho").cuda()  
+    # print("fft_src_in_trg: "+str(fft_src_in_trg.requires_grad))
+    
+    # trg_in_src = unet_model(trg_img_pad.cuda()).cuda()    
+    # # print("src_in_trg 1: "+str(src_in_trg.shape))
+    # trg_in_src = postProcessFakeImg(trg_in_src)
+    # # print("src_in_trg: "+str(src_in_trg.requires_grad))
+    # #src_in_trg = (src_in_trg - src_in_trg.min()) / (src_in_trg.max() - src_in_trg.min())
+    # #src_in_trg = torch.nn.Sigmoid()(src_in_trg)
+    # # print("src_in_trg: "+str(src_in_trg.requires_grad))
+    # fft_trg_in_src = torch.fft.fft2( trg_in_src.cuda(), dim=(-2, -1), norm="ortho").cuda() 
+    
+    
+    amp_src_in_trg, pha_src_in_trg = visual_ampl_phase( fft_src_in_trg.cuda())
+    amp_src_org, pha_src_org = extract_ampl_phase( fft_src_in_trg.cuda())
+    
+    #amp_trg_in_src, pha_trg_in_src = visual_ampl_phase( fft_trg_in_src.cuda()) 
+     
+    # print("amp_src_in_trg: "+str(amp_src_in_trg.requires_grad))
+    # print("pha_src_in_trg: "+str(pha_src_in_trg.requires_grad))
+    org_pha_in_src = pha_src_in_trg.cuda()
+    
+    pha_src_in_trg = (pha_src_in_trg - pha_src_in_trg.min()) / (pha_src_in_trg.max() - pha_src_in_trg.min())
+    amp_src_in_trg = (amp_src_in_trg - amp_src_in_trg.min()) / (amp_src_in_trg.max() - amp_src_in_trg.min())
+    src_in_trg = (src_in_trg - src_in_trg.min()) / (src_in_trg.max() - src_in_trg.min())
+    
+    # pha_trg_in_src = (pha_trg_in_src - pha_trg_in_src.min()) / (pha_trg_in_src.max() - pha_trg_in_src.min())
+    # amp_trg_in_src = (amp_trg_in_src - amp_trg_in_src.min()) / (amp_trg_in_src.max() - amp_trg_in_src.min())
+    # trg_in_src = (trg_in_src - trg_in_src.min()) / (trg_in_src.max() - trg_in_src.min())
+    
+    
+    # print("amp_trg: "+str(amp_trg.requires_grad))
+    amp_trg.requires_grad_()
+    # print("org_pha_src: "+str(org_pha_src.requires_grad))
+    org_pha_src.requires_grad_()
+    
+    fft_y_org = amp_src_org * torch.exp(1j * org_pha_src)
+    fft_y_org.requires_grad_()
+    # print("fft_y_org: "+str(fft_y_org.requires_grad))
+    
+    # fft_z_org = amp_src * torch.exp(1j * org_pha_in_src)
+    # fft_z_org.requires_grad_()
+    
+    # fft_D_org = amp_trg * torch.exp(1j * org_pha_in_src)
+    # fft_D_org.requires_grad_()
+    
+    _, imgH, imgW = src_img.size()
+    src_org = torch.fft.irfft2(fft_y_org.cuda(), dim=(-2, -1), s=[imgH, imgW])
+    src_org.requires_grad_()
+    # print("src_org: "+str(src_org.requires_grad))
+    
+    src_org = (src_org - src_org.min()) / (src_org.max() - src_org.min())
+    
+    # src_pha_org = torch.fft.irfft2(fft_z_org.cuda(), dim=(-2, -1), s=[imgH, imgW])
+    # src_pha_org.requires_grad_()
+    # # print("src_org: "+str(src_org.requires_grad))
+    
+    # src_pha_org = (src_pha_org - src_pha_org.min()) / (src_pha_org.max() - src_pha_org.min())
+    
+    # _, imgH, imgW = src_img.size()
+    # D_gen = torch.fft.irfft2(fft_D_org.cuda(), dim=(-2, -1), s=[imgH, imgW])
+    # D_gen.requires_grad_()
+    # print("src_org: "+str(src_org.requires_grad))
+    
+    # D_gen = (D_gen - D_gen.min()) / (D_gen.max() - D_gen.min())
+    
+    result_map = {
+        "image": src_org.cuda(),
+        "src_amp": amp_src.cuda(), 
+        "src_pha": pha_src.cuda(), #used
+        "fake_amp": amp_src_in_trg.cuda(), #Might need use w another disc
+        "fake_pha": pha_src_in_trg.cuda(), #Consistent w src_pha
+        # "fake_trg_amp": amp_trg_in_src.cuda(), #Consistent w trg_amp
+        # "fake_trg_pha": pha_trg_in_src.cuda(), #Consistent w trg_pha
+        "trg_amp": amp_trg.cuda(), #used
+        "trg_pha": pha_trg.cuda(), #used
+        "fake_img": src_in_trg.cuda(),#Disc as real then fake
+        # "fake_trg_img": trg_in_src.cuda(),#Dont disc yet, reconstruction loss
+        "trg_img": trg_img,
+        "src_img": src_img
+        #"src_pha_org": src_pha_org.cuda()
+    }
+    return result_map
+
+def postProcessFakeImg(src_in_trg):
+    src_in_trg = torch.mean(src_in_trg, dim=0)
+    # print("src_in_trg 2: "+str(src_in_trg.shape))
+    split_tensors = torch.split(src_in_trg, 1, dim=0)
+    # print("split_tensors: "+str(split_tensors[0].requires_grad))
+    
+    mean_tensors = [torch.mean(split_tensor, dim=0) for split_tensor in split_tensors]
+    # print("mean_tensors[0]: "+str(mean_tensors[0].shape))
+    src_in_trg = torch.stack(mean_tensors, dim=0)
+    # print("src_in_trg: "+str(src_in_trg.shape))
+    
+        
+    src_in_trg = torch.nn.functional.interpolate(src_in_trg.unsqueeze(0), size=(600, 1067)).squeeze().cuda()
+    return src_in_trg
 
 def unet_helper(src_in_trg):
     src_in_trg = torch.mean(src_in_trg, dim=0)

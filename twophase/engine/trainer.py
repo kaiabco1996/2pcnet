@@ -10,8 +10,10 @@ import numpy as np
 from collections import OrderedDict
 import torchvision.transforms as T
 from torch.nn import functional as F
-from FDA.utils import FDA_source_to_target_unet, unet_helper
+from FDA.utils import FDA_source_to_target_unet, unet_helper, FDA_source_to_target_unet_2
 import torchvision.transforms as transforms
+from collections import namedtuple
+import gc
 
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
@@ -30,6 +32,8 @@ from detectron2.data import MetadataCatalog
 import segmentation_models_pytorch as smp
 from twophase.modeling.meta_arch.rcnn import FCDiscriminator_img
 from twophase.modeling.meta_arch.rcnn import Discriminator
+from twophase.modeling.meta_arch.rcnn import GeneratorResNet, DomainAgnosticClassifier
+
 
 
 
@@ -134,31 +138,50 @@ class TwoPCTrainer(DefaultTrainer):
         optimizer = self.build_optimizer(cfg, model)
 
         # create an teacher model
+        input_shape = (3, 600, 1067)
+        input_shape_batch = (1, 3, 600, 1067)
+        
         model_teacher = self.build_model(cfg)
         self.model_teacher = model_teacher
-        
-        self.unet_model = smp.Unet('resnet101', encoder_weights='imagenet', classes=3, activation=None, encoder_depth=5, decoder_channels=[256, 128, 64, 32, 16]).cuda()
+        OPTIONS = namedtuple('OPTIONS', 'batch_size image_size \
+                              gf_dim output_c_dim is_training input_c_dim df_dim')
+        #(600, 1067)
+        self.options = OPTIONS._make((1, 512,
+                                      64, 3,
+                                      True, 3, 64))
+        torch.cuda.empty_cache()
+        n_residual_blocks = 9
+        lr = 0.0002 # adam : learning rate
+        b1 = 0.5 # adam : decay of first order momentum of gradient
+        b2 = 0.999 # adam : decay of first order momentum of gradient
+        decay_epoch = 3 # suggested default : 100 (suggested 'n_epochs' is 200)
+        #self.unet_model = smp.Unet('mobilenet_v2', encoder_weights='imagenet', classes=255, decoder_attention_type=None, activation=None, encoder_depth=5, decoder_channels=[256, 128, 64, 32, 16]).cuda()
+        self.unet_model = GeneratorResNet(input_shape, n_residual_blocks).cuda()
+        self.unet_model.apply(self.weights_init_normal)
         max_lr = 0.010#1e-3
         epoch = 15
         weight_decay = 1e-4#1e-4
-        self.optimizer_unet = torch.optim.AdamW(self.unet_model.parameters(), lr=max_lr, weight_decay=weight_decay)
-        input_shape = (3, 600, 1067)
-        self.discriminator = Discriminator(input_shape).cuda()#FCDiscriminator_img(num_classes=1067*600).cuda()
+        self.optimizer_unet = torch.optim.Adam(
+                    self.unet_model.parameters(), lr=lr, betas=(b1,b2)
+                )
+        #self.optimizer_unet = torch.optim.AdamW(self.unet_model.parameters(), lr=max_lr, weight_decay=weight_decay)
+        self.discriminator = Discriminator(input_shape).cuda()
         self.discriminator.apply(self.weights_init_normal)
         # training
         epoch = 0 # epoch to start training from
         n_epochs = 5 # number of epochs of training
         batch_size = 1 # size of the batches
-        lr = 0.0002 # adam : learning rate
-        b1 = 0.5 # adam : decay of first order momentum of gradient
-        b2 = 0.999 # adam : decay of first order momentum of gradient
-        decay_epoch = 3 # suggested default : 100 (suggested 'n_epochs' is 200)
+    
         self.optimizer_D_A = torch.optim.Adam(
-        self.discriminator.parameters(), lr=0.0001, betas=(b1,b2))#0.0002
-        lr_scheduler_D_A = torch.optim.lr_scheduler.LambdaLR(
+        self.discriminator.parameters(), lr=lr, betas=(b1,b2))#0.0002
+        self.lr_scheduler_D_A = torch.optim.lr_scheduler.LambdaLR(
                             self.optimizer_D_A,
                             lr_lambda=LambdaLR(n_epochs, epoch, decay_epoch).step
                         )
+        self.lr_scheduler_G = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer_unet,
+            lr_lambda=LambdaLR(n_epochs, epoch, decay_epoch).step
+        )
         
 
         # For training, wrap with DDP. But don't need this for inference.
@@ -429,6 +452,38 @@ class TwoPCTrainer(DefaultTrainer):
 
         return loss
     
+    def sce_criterion(self, logits, labels):
+        """
+        Computes the sigmoid cross-entropy loss between the given logits and labels.
+
+        Args:
+            logits: A PyTorch tensor of shape (batch_size, num_classes).
+            labels: A PyTorch tensor of shape (batch_size, num_classes) containing the ground truth labels.
+
+        Returns:
+            A PyTorch tensor of shape (1,) containing the loss.
+        """
+
+        loss_fn = nn.BCEWithLogitsLoss()
+        loss = loss_fn(logits, labels)
+
+        return loss
+    
+    def abs_criterion(self, in_, target):
+        """
+        Computes the mean absolute error (MAE) between the given input and target.
+
+        Args:
+            in_: A PyTorch tensor of any shape.
+            target: A PyTorch tensor of the same shape as in_.
+
+        Returns:
+            A PyTorch tensor of shape (1,) containing the loss.
+        """
+
+        loss = torch.mean(torch.abs(in_ - target))
+        return loss
+    
 
     # =====================================================
     # =================== Training Flow ===================
@@ -445,6 +500,7 @@ class TwoPCTrainer(DefaultTrainer):
         data = next(self._trainer._data_loader_iter)
         # data_q and data_k from different augmentations (q:strong, k:weak)
         # label_strong, label_weak, unlabed_strong, unlabled_weak
+        torch.cuda.empty_cache()
         label_data, unlabel_data = data
         data_time = time.perf_counter() - start
         
@@ -460,6 +516,14 @@ class TwoPCTrainer(DefaultTrainer):
         valid = Tensor(np.ones((1, *self.discriminator.output_shape))) # requires_grad = False. Default.
         #print("Valid: " + str(valid.shape))
         fake = Tensor(np.zeros((1, *self.discriminator.output_shape))) # requires_grad = False. Default.
+        A_label = np.zeros([1, 1, 1, 2], dtype=np.float32)
+        B_label = np.zeros([1, 1, 1, 2], dtype=np.float32)
+        A_label[:, :, :, 0] = 1.0
+        B_label[:, :, :, 1] = 1.0
+        A_label = torch.from_numpy(A_label).cuda()
+        B_label = torch.from_numpy(B_label).cuda()
+        self.A_label = A_label
+        self.B_label = B_label
         # label_images = [] #label_data[0]["image"].size(0)
         # unlabel_images = []
         # for item, item2 in zip(label_data, unlabel_data):
@@ -477,28 +541,46 @@ class TwoPCTrainer(DefaultTrainer):
         # self.print_gradients(self.unet_model)
         
         # self.optimizer_unet.zero_grad()
-        # # self.print_gradients(self.unet_model)
-        # transform = transforms.Pad([10, 4, 11, 4])
-
-        # # loss_target_consistency = torch.sum(torch.stack(
-        # #     [self.bhattacharyya_distance((unet_helper(
-        # #             self.unet_model(
-        # #                 torch.unsqueeze(
-        # #                     transform((unlabel_img["image"].float()/255.0).cuda()), 0)
-        # #                 ))*255).type(torch.uint8), 
-        # #         (unlabel_img["image"].float()).cuda()) for unlabel_img in unlabel_data]))*5
-        # loss_target_consistency = torch.sum(torch.stack(
-        #     [criterion_cycle(unet_helper(
-        #             self.unet_model(
-        #                 torch.unsqueeze(
-        #                     transform((unlabel_img["image"].float()/255.0).cuda()), 0)
-        #                 )), 
-        #         (unlabel_img["image"].float()/255.0).cuda()) for unlabel_img in unlabel_data]))*5
+        # # # # self.print_gradients(self.unet_model)
+        # # # transform = transforms.Pad([10, 4, 11, 4])
+        # trg_reconstruct = [FDA_source_to_target_unet_2(y["image"], x["image"], self.unet_model, start_iter) for x, y in zip(label_data, unlabel_data)]
+        # # loss_reconstruct = torch.sum(torch.stack([criterion_cycle(x["image"].cuda(), (y["image"]/255).cuda()) for x, y in zip(trg_reconstruct, unlabel_data)]).cuda()).cuda()
+        # # loss_reconstruct.backward(retain_graph=True)
+        # # # loss_brightness = (torch.sum(torch.stack([criterion_cycle(x["image"], torch.ones_like(x["src_org"]).cuda()).cuda() for x in trg_reconstruct]).cuda())).cuda()
+        # # # loss_brightness.backward(retain_graph=True)
+        # # discriminator_img_out_t_faked = [self.discriminator(torch.unsqueeze(x["image"], 0).cuda()) for x in trg_reconstruct]#[self.discriminator(x) for x in src_in_trg]
+        # # loss_discriminator_t_faked_reconstruct = torch.sum(torch.stack([F.binary_cross_entropy_with_logits(z, torch.FloatTensor(z.data.size()).fill_(target_label).cuda()).cuda() for z in discriminator_img_out_t_faked]))
+        # # loss_discriminator_t_faked_reconstruct.backward()
+        # # # # loss_target_consistency = torch.sum(torch.stack(
+        # # # #     [self.bhattacharyya_distance((unet_helper(
+        # # # #             self.unet_model(
+        # # # #                 torch.unsqueeze(
+        # # # #                     transform((unlabel_img["image"].float()/255.0).cuda()), 0)
+        # # # #                 ))*255).type(torch.uint8), 
+        # # # #         (unlabel_img["image"].float()).cuda()) for unlabel_img in unlabel_data]))*5
+        # # # loss_target_consistency = torch.sum(torch.stack(
+        # # #     [criterion_cycle(unet_helper(
+        # # #             self.unet_model(
+        # # #                 torch.unsqueeze(
+        # # #                     transform((unlabel_img["image"].float()/255.0).cuda()), 0)
+        # # #                 )), 
+        # # #         (unlabel_img["image"].float()/255.0).cuda()) for unlabel_img in unlabel_data]))*5
+        # #loss_trg_phase_consistency = (torch.sum(torch.stack([criterion_cycle(x["src_pha"], x["fake_pha"]).cuda() for x in trg_reconstruct]).cuda())).cuda()
+        # loss_reconstruct = torch.sum(torch.stack([criterion_cycle(x["fake_img"].cuda(), (y["image"]/255).cuda()) for x, y in zip(trg_reconstruct, unlabel_data)]).cuda()).cuda()
+        # #loss_reconstruct.backward(retain_graph=True)
+        # discriminator_img_out_t_faked = [self.discriminator(torch.unsqueeze(x["fake_img"], 0).cuda()) for x in trg_reconstruct]#[self.discriminator(x) for x in src_in_trg]
+        # loss_discriminator_t_faked_reconstruct = torch.sum(torch.stack([criterion_GAN(z, valid).cuda() for z in discriminator_img_out_t_faked]))
+        # #loss_discriminator_t_faked_reconstruct.backward()
         
-        # loss_target_consistency.backward()
+        # #loss_trg_amp_consistency = (torch.sum(torch.stack([criterion_cycle(x["src_amp"], x["fake_amp"]).cuda() for x in trg_reconstruct]).cuda())).cuda()
         
-        # self.optimizer_unet.step()
+        # loss_target = loss_reconstruct+loss_discriminator_t_faked_reconstruct
+        # loss_target.backward()
+        # # loss_target_consistency.backward()
         
+        #self.optimizer_unet.step()
+        # del trg_reconstruct
+        #print("Weights before: " + str(self.unet_model.state_dict()))
         self.optimizer_unet.zero_grad()
         # self.print_gradients(self.unet_model)
         
@@ -507,30 +589,13 @@ class TwoPCTrainer(DefaultTrainer):
 
         # # Print the gradients of the first layer
         # print(self.unet_model[0].weight.grad)
-        src_in_trg = [FDA_source_to_target_unet(x["image"], y["image"], self.unet_model, start_iter) for x, y in zip(label_data, unlabel_data)]
+        src_in_trg = [FDA_source_to_target_unet_2(x["image"], y["image"], self.unet_model, start_iter) for x, y in zip(label_data, unlabel_data)]
         #print(str(start_iter)+" transformation: " + str(src_in_trg))
-        image_consistency_lambda = 3
-        image_darkness_lambda = 2
+        # image_consistency_lambda = 3
+        # image_darkness_lambda = 2
         
         if start_iter%50 == 0:
-            for x, y in zip(label_data, src_in_trg):
-                avg_img = torch.mean(torch.stack((((x["image"]/255)*0.25).unsqueeze(0).cuda(), (y["src_org"]).unsqueeze(0))), dim=0)
-                avg_img_tensor = avg_img[:, [2, 1, 0], :, :]
-                rgb_img_tensor = (x["image"]/255).unsqueeze(0)
-                rgb_img_tensor = rgb_img_tensor[:, [2, 1, 0], :, :] 
-                rgb_img_tensor_2 = (y["image"]).unsqueeze(0)
-                rgb_img_tensor_2 = rgb_img_tensor_2[:, [2, 1, 0], :, :] 
-                rgb_img_tensor_3 = (y["fake_amp"]).unsqueeze(0)
-                rgb_img_tensor_3 = rgb_img_tensor_3[:, [2, 1, 0], :, :] #y["trg_amp"]
-                rgb_img_tensor_4 = (y["src_pha_org"]).unsqueeze(0)
-                rgb_img_tensor_4 = rgb_img_tensor_4[:, [2, 1, 0], :, :] #y["src_org"]
-                rgb_img_tensor_5 = (y["D_gen"]).unsqueeze(0)
-                rgb_img_tensor_5 = rgb_img_tensor_5[:, [2, 1, 0], :, :] #y["src_org"]
-                rgb_img_tensor_6 = (y["src_org"]).unsqueeze(0)
-                rgb_img_tensor_6 = rgb_img_tensor_6[:, [2, 1, 0], :, :]#trg_img
-                rgb_img_tensor_7 = (y["trg_img"]).unsqueeze(0)
-                rgb_img_tensor_7 = rgb_img_tensor_7[:, [2, 1, 0], :, :]
-                save_image([rgb_img_tensor.squeeze().type(torch.float32).cuda(),rgb_img_tensor_2.squeeze().type(torch.float32).cuda(), avg_img_tensor.squeeze().type(torch.float32).cuda(), rgb_img_tensor_6.squeeze().type(torch.float32).cuda(), rgb_img_tensor_4.squeeze().type(torch.float32).cuda(), rgb_img_tensor_5.squeeze().type(torch.float32).cuda(), rgb_img_tensor_7.squeeze().type(torch.float32).cuda()], './demo_images/'+"src_"+str(start_iter)+'.png')
+            self.compileOutputsToImage2(start_iter, label_data, src_in_trg)
             #save_image([(label["image"]/255).type(torch.float32) for label in label_data],'./demo_images/'+"src_"+str(start_iter)+'.png')
             #save_image([label["image"].type(torch.float32) for label in src_in_trg],'./demo_images/'+"src_to_target_"+str(start_iter)+'.png')
         # test_img = torch.mean(label_data[0]["image"].type(torch.float32), dim=0, keepdim=True)
@@ -543,7 +608,14 @@ class TwoPCTrainer(DefaultTrainer):
         # # Create a weighted loss function
         # weighted_loss = WeightedLoss(weight_map.cuda())
         #loss_darkness = (torch.sum(torch.stack([weighted_loss(x["src_org"], torch.zeros_like(y["image"]).cuda()).cuda() for x,y in zip(src_in_trg,unlabel_data)]).cuda())).cuda()
-        loss_darkness = (torch.sum(torch.stack([criterion_cycle(x["src_org"], torch.zeros_like(x["src_org"]).cuda()).cuda() for x in src_in_trg]).cuda())).cuda()
+        ##loss_darkness = (torch.sum(torch.stack([criterion_cycle(x["image"], torch.zeros_like(x["src_org"]).cuda()).cuda() for x in src_in_trg]).cuda())).cuda()
+        loss_darkness = (torch.sum(torch.stack([criterion_cycle(x["fake_img"], torch.zeros_like(x["fake_img"]).cuda()).cuda() for x in src_in_trg]).cuda())).cuda()
+
+        #loss_src_phase_consistency = (torch.sum(torch.stack([criterion_cycle(x["src_pha"], x["fake_pha"]).cuda() for x in src_in_trg]).cuda())).cuda()
+        # loss_trg_phase_consistency = (torch.sum(torch.stack([criterion_GAN(x["trg_pha"], x["fake_trg_pha"]).cuda() for x in src_in_trg]).cuda())).cuda()
+        # loss_trg_amp_consistency = (torch.sum(torch.stack([criterion_GAN(x["trg_amp"], x["fake_trg_amp"]).cuda() for x in src_in_trg]).cuda())).cuda()
+        # #loss_trg_reconstruction = (torch.sum(torch.stack([criterion_identity(y["image"].cuda(), x["fake_trg_img"].cuda()) for x,y in zip(src_in_trg, unlabel_data)]).cuda())).cuda()
+        
         
         #loss_darkness = (torch.sum(torch.stack([criterion_cycle(x["src_org"], (y["image"]/255).cuda()).cuda() for x,y in zip(src_in_trg, unlabel_data)]).cuda())).cuda()
         
@@ -553,7 +625,7 @@ class TwoPCTrainer(DefaultTrainer):
         #         ) for x, y in zip(label_data, src_in_trg)]
         #     ).cuda()).cuda()
         #Consistency Loss
-        #loss_consistency_fda = torch.sum(torch.stack([criterion_cycle(x["src_org"].cuda(), (y["image"]/255).cuda()) for x, y in zip(src_in_trg, label_data)]).cuda()).cuda()
+        loss_consistency_fda = torch.sum(torch.stack([criterion_cycle(x["fake_img"].cuda(), (y["image"]/255).cuda()) for x, y in zip(src_in_trg, label_data)]).cuda()).cuda()
         # print("src_org: "+str(loss_consistency_fda.requires_grad))
         
         #loss_color_reg = torch.sum(torch.stack([self.color_regularization_loss(torch.unsqueeze(x["src_org"],0), torch.unsqueeze(y["image"]/255,0)) for x, y in zip(src_in_trg, unlabel_data)]).cuda()).cuda()
@@ -565,11 +637,13 @@ class TwoPCTrainer(DefaultTrainer):
         #loss_consistency_amp = (torch.sum(torch.stack([criterion_cycle(x["fake_amp"].cuda(), (x["trg_amp"]).cuda()) for x in src_in_trg]))*1000).cuda()
         #print("loss_consistency_phase: "+str(loss_consistency_amp.requires_grad))
         
-        loss_color_consistency = torch.sum(torch.stack([torch.mean(loss_color(torch.unsqueeze(x["image"], 0))).cuda() for x in src_in_trg]))*25
-        loss_variation_org = torch.sum(torch.stack([torch.mean(loss_variation(torch.unsqueeze(x["src_org"], 0))).cuda() for x in src_in_trg]))*160
+        loss_color_consistency = torch.sum(torch.stack([torch.mean(loss_color(torch.unsqueeze(x["fake_image"], 0))).cuda() for x in src_in_trg]))*25
+        #loss_variation_org = torch.sum(torch.stack([torch.mean(loss_variation(torch.unsqueeze(x["src_org"], 0))).cuda() for x in src_in_trg]))*160
         
         #loss_consistency_fda_amp = torch.sum(torch.tensor([criterion_cycle(x["src_amp"], x["fake_amp"]) for x in src_in_trg], requires_grad=True)).cuda()
-        discriminator_img_out_t_faked = [self.discriminator(torch.unsqueeze(x["image"], 0).cuda()) for x in src_in_trg]#[self.discriminator(x) for x in src_in_trg]
+        ##discriminator_img_out_t_faked = [self.discriminator(torch.unsqueeze(x["image"], 0).cuda()) for x in src_in_trg]#[self.discriminator(x) for x in src_in_trg]
+        discriminator_img_out_t_faked = [self.discriminator(torch.unsqueeze(x["fake_img"], 0).cuda()) for x in src_in_trg]#[self.discriminator(x) for x in src_in_trg]
+        
         #discriminator_img_out_t_faked_pha = [self.discriminator(torch.unsqueeze(x["src_pha_org"], 0).cuda()) for x in src_in_trg]#[self.discriminator(x) for x in src_in_trg]
         
         
@@ -578,19 +652,20 @@ class TwoPCTrainer(DefaultTrainer):
         # else:
         #     discriminator_img_out_t_faked = [self.discriminator(torch.unsqueeze(x["image"], 0).cuda()) for x in src_in_trg]#[self.discriminator(x) for x in src_in_trg]
             
+        #loss_discriminator_t_faked = torch.sum(torch.stack([criterion_GAN(z, A_label).cuda() for z in discriminator_img_out_t_faked]))
         loss_discriminator_t_faked = torch.sum(torch.stack([criterion_GAN(z, valid).cuda() for z in discriminator_img_out_t_faked]))
         #loss_discriminator_t_faked_pha = torch.sum(torch.stack([criterion_GAN(z, valid).cuda() for z in discriminator_img_out_t_faked_pha]))
         
         # Calculate the edge maps of the input and target images.
         # Calculate the mean squared error between the edge maps of the input and target images.
-        loss_edge = torch.sum(torch.stack(
-            [self.edge_loss(
-                torch.unsqueeze(torch.mean((input_image["image"]/255).type(torch.float32).cuda(), dim=0, keepdim=True),0), 
-                torch.unsqueeze(torch.mean(output_image["image"].type(torch.float32).cuda(), dim=0, keepdim=True),0)) 
-             for input_image, output_image in zip(label_data, src_in_trg)]))*10
+        # loss_edge = torch.sum(torch.stack(
+        #     [self.edge_loss(
+        #         torch.unsqueeze(torch.mean((input_image["image"]/255).type(torch.float32).cuda(), dim=0, keepdim=True),0), 
+        #         torch.unsqueeze(torch.mean(output_image["image"].type(torch.float32).cuda(), dim=0, keepdim=True),0)) 
+        #      for input_image, output_image in zip(label_data, src_in_trg)]))*10
         
         # print("loss_discriminator_t_faked: "+str(loss_discriminator_t_faked.requires_grad))
-        loss_gen = (loss_discriminator_t_faked)+(loss_darkness*loss_discriminator_t_faked)+loss_variation_org+loss_edge+loss_color_consistency#+loss_consistency_fda#+(loss_edge)#+loss_color_reg+loss_color_consistency#+(loss_discriminator_t_faked_pha/5)#+loss_variation_org##+(loss_edge)#+loss_color_org+loss_variation_org#+loss_consistency_amp#+loss_consistency_fda#+loss_consistency_phase
+        loss_gen = (loss_discriminator_t_faked+loss_darkness*0.5+loss_consistency_fda)+loss_color_consistency#+loss_trg_phase_consistency+loss_trg_amp_consistency#+loss_trg_reconstruction#+loss_color_consistency#+loss_consistency_fda##+loss_edge+loss_color_consistency#+loss_variation_org#+loss_consistency_fda#+(loss_edge)#+loss_color_reg+loss_color_consistency#+(loss_discriminator_t_faked_pha/5)#+loss_variation_org##+(loss_edge)#+loss_color_org+loss_variation_org#+loss_consistency_amp#+loss_consistency_fda#+loss_consistency_phase
         #loss_darkness.backward()
         #loss_consistency_fda.backward()
         #loss_consistency_fda_amp.backward()
@@ -598,6 +673,7 @@ class TwoPCTrainer(DefaultTrainer):
         loss_gen.backward()
         self.optimizer_unet.step()
         
+        #print("Weights after: " + str(self.unet_model.state_dict()))
         
         #print("After unet weights" + str(self.unet_model.state_dict()), file=open('after_unet.txt', 'a'))
         # Print the weights of the first layer
@@ -608,10 +684,11 @@ class TwoPCTrainer(DefaultTrainer):
         
         # print("Before disc weights" + str(self.discriminator.state_dict()), file=open('before_disc.txt', 'a'))
         # self.print_gradients(self.unet_model)
+        #print("Weights before: " + str(self.discriminator.state_dict()))
         self.optimizer_D_A.zero_grad()
         # self.print_gradients(self.unet_model)
         #Discriminator Loss, fake = src, valid = target
-        self.unet_model.requires_grad_ = False
+        #self.unet_model.requires_grad_ = False
         #loss_discriminator_t = 0
         
         # if loss_discriminator_t_faked < 1:
@@ -621,11 +698,15 @@ class TwoPCTrainer(DefaultTrainer):
         # else:
         #     loss_discriminator_t = 0
         
-        discriminator_img_out_s = [self.discriminator(torch.unsqueeze(x["image"].float(), 0).cuda()) for x in label_data]#[self.discriminator(x) for x in src_in_trg]
-        loss_discriminator_s = torch.sum(torch.stack([criterion_GAN(z, fake).cuda() for z in discriminator_img_out_s]))
-        loss_discriminator_s.backward(retain_graph=True)
+        # discriminator_img_out_s = [self.discriminator(torch.unsqueeze(x["image"].float(), 0).cuda()) for x in label_data]#[self.discriminator(x) for x in src_in_trg]
+        # loss_discriminator_s = torch.sum(torch.stack([criterion_GAN(z, fake).cuda() for z in discriminator_img_out_s]))
+        # loss_discriminator_s.backward(retain_graph=True)
         
-        
+        ## discriminator_img_out_t = [self.discriminator(torch.unsqueeze(x["image"].detach(), 0).cuda()) for x in src_in_trg]#[self.discriminator(x) for x in src_in_trg]
+        discriminator_img_out_t = [self.discriminator(torch.unsqueeze(x["fake_img"].detach(), 0).cuda()) for x in src_in_trg]#[self.discriminator(x) for x in src_in_trg]
+        loss_discriminator_t = torch.sum(torch.stack([criterion_GAN(z, fake).cuda() for z in discriminator_img_out_t]))
+        loss_discriminator_t.backward(retain_graph=True)
+        #del src_in_trg
         discriminator_img_out_real_t = [self.discriminator(torch.unsqueeze(x["image"].float(), 0).cuda()) for x in unlabel_data]#[self.discriminator(x) for x in src_in_trg]
         
         # print("loss_discriminator_t: "+str(loss_discriminator_t.requires_grad))
@@ -647,25 +728,38 @@ class TwoPCTrainer(DefaultTrainer):
         loss_discriminator_real_t.backward()
         # print("After disc weights" + str(self.discriminator.state_dict()), file=open('after_disc.txt', 'a'))
         self.optimizer_D_A.step()
+        #self.lr_scheduler_D_A.step()
+        #print("Weights after: " + str(self.discriminator.state_dict()))
+        
         # print("After disc weights" + str(self.discriminator.state_dict()), file=open('after_disc.txt', 'a'))
         
         
         temp_dict = {
+                #'loss_brightness': loss_brightness,
+                #'loss_reconstruct': loss_reconstruct,
                 'loss_darkness': loss_darkness,
+                # 'loss_src_phase_consistency': loss_src_phase_consistency,
+                # 'loss_trg_phase_consistency': loss_trg_phase_consistency,
+                # 'loss_trg_amp_consistency': loss_trg_amp_consistency,
+                #'loss_trg_reconstruction': loss_trg_reconstruction,
+                # 'loss_color_consistency_1': loss_color_consistency_1,
+                # 'loss_edge_1': loss_edge_1,
                 #'loss_color_reg': loss_color_reg,
                 #'loss_target_consistency': loss_target_consistency,
-                'loss_color_consistency': loss_color_consistency,
-                'loss_variation_org': loss_variation_org,
+                #'loss_color_consistency': loss_color_consistency,
+                #'loss_variation_org': loss_variation_org,
                 #'loss_edge': loss_edge,
-                #'loss_consistency_fda': loss_consistency_fda,
+                'loss_consistency_fda': loss_consistency_fda,
+                # 'loss_discriminator_t_faked_1': loss_discriminator_t_faked_1,
                 # 'loss_consistency_fda_amp': loss_consistency_fda_amp,
                 #'loss_consistency_amp': loss_consistency_amp,
                 #'loss_consistency_phase': loss_consistency_phase,
+                #'loss_discriminator_t_faked_reconstruct': loss_discriminator_t_faked_reconstruct,
                 'loss_discriminator_t_faked': loss_discriminator_t_faked,
                 #'loss_discriminator_t_faked_pha': loss_discriminator_t_faked_pha,
                 #'loss_disc': loss_disc,
-                #'loss_discriminator_gen_t': loss_discriminator_t,
-                'loss_discriminator_s': loss_discriminator_s,
+                'loss_discriminator_gen_t': loss_discriminator_t,
+                #'loss_discriminator_s': loss_discriminator_s,
                 'loss_discriminator_real_t': loss_discriminator_real_t,
             }
         #print(temp_dict)
@@ -679,7 +773,7 @@ class TwoPCTrainer(DefaultTrainer):
 
         # # Add NightAug images into supervised batch
         # if self.cfg.NIGHTAUG:
-        #     label_data_aug = self.night_aug.aug([x.copy() for x in label_data])
+            #label_data_aug = self.night_aug.aug([x.copy() for x in label_data])
         #     label_data.extend(label_data_aug)
             
 
@@ -860,6 +954,69 @@ class TwoPCTrainer(DefaultTrainer):
         if self.iter >= self.cfg.SEMISUPNET.BURN_UP_STEP and self.cfg.STUDENT_SCALE:
             metrics_dict["scale"] = self.stu_scale
         self._write_metrics(metrics_dict)
+
+    def compileOutputsToImage(self, start_iter, label_data, src_in_trg):
+        for x, y in zip(label_data, src_in_trg):
+            avg_img = torch.mean(torch.stack((((x["image"]/255)*0.25).unsqueeze(0).cuda(), (y["src_org"]).unsqueeze(0))), dim=0)
+            avg_img_tensor = avg_img[:, [2, 1, 0], :, :]
+            rgb_img_tensor = (x["image"]/255).unsqueeze(0)
+            rgb_img_tensor = rgb_img_tensor[:, [2, 1, 0], :, :] 
+            rgb_img_tensor_2 = (y["image"]).unsqueeze(0)
+            rgb_img_tensor_2 = rgb_img_tensor_2[:, [2, 1, 0], :, :] 
+            rgb_img_tensor_3 = (y["fake_amp"]).unsqueeze(0)
+            rgb_img_tensor_3 = rgb_img_tensor_3[:, [2, 1, 0], :, :] #y["trg_amp"]
+            rgb_img_tensor_4 = (y["src_pha_org"]).unsqueeze(0)
+            rgb_img_tensor_4 = rgb_img_tensor_4[:, [2, 1, 0], :, :] #y["src_org"]
+            rgb_img_tensor_5 = (y["D_gen"]).unsqueeze(0)
+            rgb_img_tensor_5 = rgb_img_tensor_5[:, [2, 1, 0], :, :] #y["src_org"]
+            rgb_img_tensor_6 = (y["src_org"]).unsqueeze(0)
+            rgb_img_tensor_6 = rgb_img_tensor_6[:, [2, 1, 0], :, :]#trg_img
+            rgb_img_tensor_7 = (y["trg_img"]).unsqueeze(0)
+            rgb_img_tensor_7 = rgb_img_tensor_7[:, [2, 1, 0], :, :]
+            save_image([rgb_img_tensor.squeeze().type(torch.float32).cuda(),rgb_img_tensor_2.squeeze().type(torch.float32).cuda(), avg_img_tensor.squeeze().type(torch.float32).cuda(), rgb_img_tensor_6.squeeze().type(torch.float32).cuda(), rgb_img_tensor_4.squeeze().type(torch.float32).cuda(), rgb_img_tensor_5.squeeze().type(torch.float32).cuda(), rgb_img_tensor_7.squeeze().type(torch.float32).cuda()], './demo_images/'+"src_"+str(start_iter)+'.png')
+
+    def compileOutputsToImage2(self, start_iter, label_data, src_in_trg):
+        for x, y in zip(label_data, src_in_trg):
+            # avg_img = torch.mean(torch.stack((((x["image"]/255)*0.25).unsqueeze(0).cuda(), (y["src_org"]).unsqueeze(0))), dim=0)
+            # avg_img_tensor = avg_img[:, [2, 1, 0], :, :]
+            rgb_img_tensor = (x["image"]/255).unsqueeze(0)
+            rgb_img_tensor = rgb_img_tensor[:, [2, 1, 0], :, :] 
+            rgb_img_tensor_2 = (y["src_amp"]).unsqueeze(0)
+            rgb_img_tensor_2 = rgb_img_tensor_2[:, [2, 1, 0], :, :] 
+            rgb_img_tensor_3 = (y["src_pha"]).unsqueeze(0)
+            rgb_img_tensor_3 = rgb_img_tensor_3[:, [2, 1, 0], :, :] #y["trg_amp"]
+            rgb_img_tensor_4 = (y["image"]).unsqueeze(0)
+            rgb_img_tensor_4 = rgb_img_tensor_4[:, [2, 1, 0], :, :] #y["src_org"]
+            rgb_img_tensor_5 = (y["fake_amp"]).unsqueeze(0)
+            rgb_img_tensor_5 = rgb_img_tensor_5[:, [2, 1, 0], :, :] #y["src_org"]
+            rgb_img_tensor_6 = (y["fake_img"]).unsqueeze(0)
+            rgb_img_tensor_6 = rgb_img_tensor_6[:, [2, 1, 0], :, :]#trg_img
+            rgb_img_tensor_7 = (y["trg_img"]).unsqueeze(0)
+            rgb_img_tensor_7 = rgb_img_tensor_7[:, [2, 1, 0], :, :]
+            rgb_img_tensor_8 = (y["trg_amp"]).unsqueeze(0)
+            rgb_img_tensor_8 = rgb_img_tensor_8[:, [2, 1, 0], :, :]
+            rgb_img_tensor_9 = (y["trg_pha"]).unsqueeze(0)
+            rgb_img_tensor_9 = rgb_img_tensor_9[:, [2, 1, 0], :, :]
+            # rgb_img_tensor_10 = (z["fake_img"]).unsqueeze(0)
+            # rgb_img_tensor_10 = rgb_img_tensor_10[:, [2, 1, 0], :, :]
+            # rgb_img_tensor_11 = (z["fake_amp"]).unsqueeze(0)
+            # rgb_img_tensor_11 = rgb_img_tensor_11[:, [2, 1, 0], :, :]
+            # rgb_img_tensor_12 = (z["fake_pha"]).unsqueeze(0)
+            # rgb_img_tensor_12 = rgb_img_tensor_12[:, [2, 1, 0], :, :]
+            save_image([rgb_img_tensor.squeeze().type(torch.float32).cuda(), #src img
+                        rgb_img_tensor_2.squeeze().type(torch.float32).cuda(),#src_amp
+                        rgb_img_tensor_3.squeeze().type(torch.float32).cuda(), #src_phase, fake_img, fake_amp, fake_pha
+                        rgb_img_tensor_4.squeeze().type(torch.float32).cuda(), #trg img, trg_amp, trg_pha, fake_trg_img, fake_trg_amp, fake_trg_pha
+                        rgb_img_tensor_5.squeeze().type(torch.float32).cuda(), #
+                        rgb_img_tensor_6.squeeze().type(torch.float32).cuda(), 
+                        rgb_img_tensor_7.squeeze().type(torch.float32).cuda(),
+                        rgb_img_tensor_8.squeeze().type(torch.float32).cuda(),
+                        rgb_img_tensor_9.squeeze().type(torch.float32).cuda(),
+                        # rgb_img_tensor_10.squeeze().type(torch.float32).cuda(),
+                        # rgb_img_tensor_11.squeeze().type(torch.float32).cuda(),
+                        # rgb_img_tensor_12.squeeze().type(torch.float32).cuda(),                        
+                        ], 
+                       './demo_images/'+"src_"+str(start_iter)+'.png')
 
         # self.optimizer.zero_grad()
         # losses.backward()

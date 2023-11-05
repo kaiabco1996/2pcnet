@@ -16,6 +16,214 @@ from detectron2.utils.events import get_event_storage
 from detectron2.structures import ImageList
 
 #######################
+# class GaussianNoiseLayer(nn.Module):
+#     def __init__(self, std):
+#         super(GaussianNoiseLayer, self).__init__()
+#         self.std = std
+
+#     def forward(self, input):
+#         if self.training:
+#             noise = torch.randn(input.size(), dtype=input.dtype, device=input.device) * self.std
+#             return input + noise
+#         return input
+    
+# class InstanceNorm(nn.Module):
+#     def __init__(self, input_dim):
+#         super(InstanceNorm, self).__init__()
+        
+#     def forward(self, input):
+#         depth = input.size(1)
+#         with torch.no_grad():
+#             self.scale = nn.Parameter(torch.randn(input.shape, dtype=torch.float32)).cuda()
+#             self.offset = nn.Parameter(torch.zeros(input.shape, dtype=torch.float32)).cuda()
+#             mean = torch.mean(input, dim=[2, 3], keepdim=True)
+#             variance = torch.var(input, dim=[2, 3], keepdim=True)
+#             epsilon = 1e-5
+#             inv = 1.0 / torch.sqrt(variance + epsilon)
+#             normalized = (input - mean) * inv
+#             # print(normalized.shape)
+#             # print(self.scale.shape)
+#             # print(self.offset.shape)
+        
+#         return self.scale * normalized + self.offset
+
+# def conv2d(input_dim, output_dim, ks=4, s=2, stddev=0.02):
+#     conv_layer = nn.Conv2d(input_dim, output_dim, ks, s, padding=ks // 2)
+#     conv_layer.weight.data.normal_(0.0, stddev)
+#     return conv_layer
+
+# def deconv2d(input_dim, output_dim, ks=4, s=2, stddev=0.02):
+#     deconv_layer = nn.ConvTranspose2d(input_dim, output_dim, ks, s, padding=ks // 2)
+#     deconv_layer.weight.data.normal_(0.0, stddev)
+#     return deconv_layer
+
+# def gaussian_noise_layer(input_layer, std):
+#     noise = torch.randn(input_layer.size(), dtype=torch.float32) * std
+#     return input_layer + noise.cuda()
+
+# class ResidualBlock(nn.Module):
+#     def __init__(self, dim, ks=3, s=1):
+#         super(ResidualBlock, self).__init__()
+#         self.conv1 = nn.Conv2d(dim, dim, ks, s, padding=ks // 2)
+#         self.conv2 = nn.Conv2d(dim, dim, ks, s, padding=ks // 2)
+#         self.norm1 = InstanceNorm(dim)
+#         self.norm2 = InstanceNorm(dim)
+
+#     def forward(self, x):
+#         y = self.norm1(self.conv1(x))
+#         y = F.relu(y)
+#         y = self.norm2(self.conv2(y))
+#         return y + x
+
+# class GeneratorResNet(nn.Module):
+#     def __init__(self, options):
+#         super(GeneratorResNet, self).__init__()
+#         self.options = options
+#         self.encoder = nn.Sequential(
+#             nn.ReflectionPad2d(3),
+#             conv2d(options.input_c_dim, options.gf_dim, 7, 1),
+#             InstanceNorm(options.gf_dim),
+#             nn.ReLU(),
+#             conv2d(options.gf_dim, options.gf_dim * 2, 3, 2),
+#             InstanceNorm(options.gf_dim*2),
+#             nn.ReLU(),
+#             conv2d(options.gf_dim * 2, options.gf_dim * 4, 3, 2),
+#             InstanceNorm(options.gf_dim*4),
+#             nn.ReLU()
+#         )
+#         self.residual_blocks = nn.ModuleList([ResidualBlock(options.gf_dim * 4) for _ in range(5)])
+#         self.translation_decoder = nn.Sequential(
+#             ResidualBlock(options.gf_dim * 4),
+#             ResidualBlock(options.gf_dim * 4),
+#             ResidualBlock(options.gf_dim * 4),
+#             ResidualBlock(options.gf_dim * 4),
+#             deconv2d(options.gf_dim * 4, options.gf_dim * 2, 3, 2),
+#             InstanceNorm(options.gf_dim*2),
+#             nn.ReLU(),
+#             deconv2d(options.gf_dim * 2, options.gf_dim, 3, 2),
+#             InstanceNorm(options.gf_dim),
+#             nn.ReflectionPad2d(3),
+#             nn.Conv2d(options.gf_dim, options.output_c_dim, 7, 1),
+#             nn.Tanh()
+#         )
+#         # self.reconstruction_decoder = nn.Sequential(
+#         #     GaussianNoiseLayer(0.02),
+#         #     ResidualBlock(options.gf_dim * 4),
+#         #     GaussianNoiseLayer(0.02),
+#         #     ResidualBlock(options.gf_dim * 4),
+#         #     ResidualBlock(options.gf_dim * 4),
+#         #     ResidualBlock(options.gf_dim * 4),
+#         #     deconv2d(options.gf_dim * 4, options.gf_dim * 2, 3, 2),
+#         #     InstanceNorm(options.gf_dim*2),
+#         #     nn.ReLU(),
+#         #     deconv2d(options.gf_dim * 2, options.gf_dim, 3, 2),
+#         #     InstanceNorm(options.gf_dim),
+#         #     nn.ReflectionPad2d(3),
+#         #     nn.Conv2d(options.gf_dim, options.output_c_dim, 7, 1),
+#         #     nn.Tanh()
+#         # )
+
+#     def forward(self, image):
+#         c0 = F.pad(image, (3, 3, 3, 3), "reflect")
+#         c1 = self.encoder(c0)
+#         r = c1
+#         for block in self.residual_blocks:
+#             r = block(r)
+#         r5 = r
+#         r6 = self.translation_decoder(r5)
+#         #r5 = gaussian_noise_layer(r5, 0.02)
+#         # r6_rec = self.reconstruction_decoder(r5)
+#         return r6
+
+class DomainAgnosticClassifier(nn.Module):
+    def __init__(self, options):
+        super(DomainAgnosticClassifier, self).__init__()
+
+        self.conv1 = conv2d(3, options.df_dim * 4)
+        self.norm1 = InstanceNorm(options.df_dim * 4)
+        self.conv2 = conv2d(options.df_dim * 4, options.df_dim * 2)
+        self.norm2 = InstanceNorm(options.df_dim * 2)
+        self.conv3 = conv2d(options.df_dim * 2, options.df_dim * 2)
+        self.norm3 = InstanceNorm(options.df_dim * 2)
+        self.prediction = conv2d(options.df_dim * 2, 2)
+
+    def forward(self, percep):
+        h1 = F.leaky_relu(self.norm1(self.conv1(percep)))
+        h2 = F.leaky_relu(self.norm2(self.conv2(h1)))
+        h3 = F.leaky_relu(self.norm3(self.conv3(h2)))
+        h4 = self.prediction(h3)
+        h4_mean = h4.mean(dim=(0, 2, 3), keepdim=True)
+        return h4_mean.view(-1, 1, 1, 2)
+    
+class ResidualBlock(nn.Module):
+    def __init__(self, in_features):
+        super(ResidualBlock, self).__init__()
+        
+        self.block = nn.Sequential(
+            nn.ReflectionPad2d(1), # Pads the input tensor using the reflection of the input boundary
+            nn.Conv2d(in_features, in_features, 3),
+            nn.InstanceNorm2d(in_features), 
+            nn.ReLU(inplace=True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(in_features, in_features, 3),
+            nn.InstanceNorm2d(in_features)
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+class GeneratorResNet(nn.Module):
+    def __init__(self, input_shape, num_residual_block):
+        super(GeneratorResNet, self).__init__()
+        
+        channels = input_shape[0]
+        
+        # Initial Convolution Block
+        out_features = 64
+        model = [
+            nn.ReflectionPad2d(channels),
+            nn.Conv2d(channels, out_features, 7),
+            nn.InstanceNorm2d(out_features),
+            nn.ReLU(inplace=True)
+        ]
+        in_features = out_features
+        
+        # Downsampling
+        for _ in range(2):
+            out_features *= 2
+            model += [
+                nn.Conv2d(in_features, out_features, 3, stride=2, padding=1),
+                nn.InstanceNorm2d(out_features),
+                nn.ReLU(inplace=True)
+            ]
+            in_features = out_features
+        
+        # Residual blocks
+        for _ in range(num_residual_block):
+            model += [ResidualBlock(out_features)]
+            
+        # Upsampling
+        for _ in range(2):
+            out_features //= 2
+            model += [
+                nn.Upsample(scale_factor=2), # --> width*2, heigh*2
+                nn.Conv2d(in_features, out_features, 3, stride=1, padding=1),
+                nn.ReLU(inplace=True)
+            ]
+            in_features = out_features
+            
+        # Output Layer
+        model += [nn.ReflectionPad2d(channels),
+                  nn.Conv2d(out_features, channels, 7),
+                  nn.Tanh()
+                 ]
+        
+        # Unpacking
+        self.model = nn.Sequential(*model) 
+        
+    def forward(self, x):
+        return self.model(x)
+    
 class Discriminator(nn.Module):
     def __init__(self, input_shape):
         super(Discriminator, self).__init__()
